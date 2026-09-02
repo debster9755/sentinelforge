@@ -8,9 +8,9 @@ sources:
     last_reviewed_at: 2026-09-02
     transport: huggingface
     uri: https://huggingface.co/datasets/databricks/databricks-dolly-15k
-    revision: REPLACE_WITH_IMMUTABLE_REVISION
+    revision: bdd27f4d94b9c1f951818a7da7fd7aeea5dbff1a
     subset: train
-    expected_content_sha256: REPLACE_WITH_64_HEX_SHA256
+    expected_content_sha256: 2df9083338b4abd6bceb5635764dab5d833b393b55759dffb0959b6fcbf794ec
     importer: dolly_v1
     canonical_schema_version: 1.0.0
     allowed_uses:
@@ -30,9 +30,9 @@ sources:
     last_reviewed_at: 2026-09-02
     transport: git
     uri: https://github.com/microsoft/BIPIA
-    revision: REPLACE_WITH_COMMIT_SHA
+    revision: a004b69ec0dd446e0afd461d98cb5e96e120a5d0
     subset: test
-    expected_content_sha256: REPLACE_WITH_64_HEX_SHA256
+    expected_content_sha256: MULTI_ARTIFACT_HASHES_IN_PUBLIC_DATASETS_JSON
     importer: bipia_v1
     canonical_schema_version: 1.0.0
     allowed_uses:
@@ -54,9 +54,9 @@ sources:
     last_reviewed_at: 2026-09-02
     transport: git
     uri: https://github.com/ethz-spylab/agentdojo
-    revision: REPLACE_WITH_RELEASE_OR_COMMIT
+    revision: v0.1.35
     subset: benchmark_suite
-    expected_content_sha256: REPLACE_WITH_64_HEX_SHA256
+    expected_content_sha256: RECORDED_RESULT_SHA256_REQUIRED
     importer: agentdojo_adapter_v1
     canonical_schema_version: 1.0.0
     allowed_uses:

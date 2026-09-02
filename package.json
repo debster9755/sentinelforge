@@ -9,6 +9,7 @@
     "dev": "vinext dev",
     "build": "vinext build",
     "start": "wrangler dev --config dist/server/wrangler.json",
+    "dataset": "node scripts/dataset-cli.mjs",
     "test": "node --experimental-strip-types --test tests/*.test.ts",
     "lint": "oxlint app lib",
     "format": "oxfmt"

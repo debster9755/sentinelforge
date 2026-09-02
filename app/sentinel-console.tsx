@@ -1,11 +1,12 @@
 'use client';
 
 import { useState } from 'react';
-import { Activity, ArrowRight, CheckCircle2, ChevronDown, CircleDollarSign, Clock3, Command, Database, FileCheck2, Gauge, GitBranch, LayoutDashboard, LockKeyhole, Play, RotateCcw, ShieldCheck, ShieldX, Sparkles } from 'lucide-react';
+import { Activity, ArrowRight, Check, CheckCircle2, ChevronDown, CircleDollarSign, Clock3, CloudDownload, Command, Copy, ExternalLink, FileCheck2, Gauge, GitBranch, LayoutDashboard, LockKeyhole, Play, RotateCcw, ShieldCheck, ShieldX, Sparkles } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { consumeApproval, createApproval, decide, evaluationRows, scenarioRequests, type ApprovalRecord, type Decision } from '@/lib/gateway';
+import { publicDatasetRegistry, sourceCommand } from '@/lib/public-datasets';
 
 const scenarios = [
   { id: 'public-summary', label: 'Public summary' },
@@ -172,7 +173,53 @@ function PolicyRow({ version, name, status, meta }: { version: string; name: str
 
 function EvaluationsView() { return <><PageHeading eyebrow="Evaluation harness" title="Security, quality, and cost—together." description="Metrics stay segmented by source and attack family so aggregate performance cannot hide a failed category." action={<Button className="bg-cyan-400 text-slate-950 hover:bg-cyan-300"><Play />Run deterministic suite</Button>} /><div className="mb-5 grid gap-3 sm:grid-cols-2 xl:grid-cols-4"><Metric icon={ShieldCheck} label="Attack recall" value="93.8%" detail="target ≥ 90%" tone="cyan" /><Metric icon={ShieldX} label="Benign block" value="3.1%" detail="target ≤ 5%" tone="emerald" /><Metric icon={Gauge} label="Quality pass" value="96.4%" detail="−1.2 pp vs strong" tone="amber" /><Metric icon={CircleDollarSign} label="Safe success / $" value="487" detail="+52% vs baseline" tone="rose" /></div><Card className="surface-card"><CardHeader className="border-b border-white/8 pb-4"><p className="eyebrow">Immutable run · eval_2026_09_02_01</p><CardTitle>Source and family breakdown</CardTitle></CardHeader><CardContent className="overflow-x-auto pt-2"><table className="w-full min-w-[680px] text-left text-xs"><thead className="text-[10px] uppercase tracking-[.13em] text-muted-foreground"><tr>{['Source', 'Family', 'Cases', 'Attack recall', 'Benign blocked', 'Gate'].map((heading) => <th key={heading} className="border-b border-white/8 px-3 py-3 font-medium">{heading}</th>)}</tr></thead><tbody>{evaluationRows.map((row) => <tr key={`${row.source}-${row.family}`} className="border-b border-white/6 last:border-0"><td className="px-3 py-4 font-medium">{row.source}</td><td className="px-3 py-4 text-muted-foreground">{row.family}</td><td className="px-3 py-4 font-mono">{row.cases}</td><td className="px-3 py-4 font-mono">{row.recall}</td><td className="px-3 py-4 font-mono">{row.blocked}</td><td className="px-3 py-4"><Badge className="bg-emerald-400/10 text-emerald-300">{row.status}</Badge></td></tr>)}</tbody></table></CardContent></Card></>; }
 
-function DataReleasesView() { const gates = ['Canonical schema', 'Provenance & licence', 'Privacy & canary scan', 'Exact / near dedupe', 'Holdout isolation', 'Human review']; return <><PageHeading eyebrow="Dataset supply chain" title="Evidence before activation." description="Public content stays disabled by default, pinned to immutable revisions, quarantined, normalized, and reviewed before it can enter a release." action={<Button variant="outline"><Database />Inspect manifest</Button>} /><div className="grid gap-5 xl:grid-cols-[minmax(0,1.1fr)_minmax(340px,.9fr)]"><Card className="surface-card"><CardHeader className="border-b border-white/8 pb-4"><p className="eyebrow">Release registry</p><CardTitle>sf-dataset-2026.09.02-rc1</CardTitle></CardHeader><CardContent className="pt-5"><div className="grid gap-3 sm:grid-cols-4"><ResultFact label="Cases" value="1,000" /><ResultFact label="Sources" value="3" /><ResultFact label="Rejected" value="12" /><ResultFact label="Leakage" value="0" /></div><div className="mt-5 space-y-2">{[['Repository synthetic','enabled','1,000 cases'],['Dolly 15k','reviewed fixture','80 cases'],['BIPIA test','external holdout','120 isolated'],['AgentDojo','disabled','adapter only']].map(([name,status,count]) => <div key={name} className="flex items-center justify-between rounded-lg border border-white/7 p-3"><div><p className="text-xs font-medium">{name}</p><p className="mt-1 text-[11px] text-muted-foreground">{count}</p></div><Badge variant="outline" className="border-white/10 text-muted-foreground">{status}</Badge></div>)}</div></CardContent></Card><Card className="surface-card"><CardHeader className="border-b border-white/8 pb-4"><p className="eyebrow">Activation gates</p><CardTitle>6 of 6 pass</CardTitle></CardHeader><CardContent className="space-y-3 pt-5">{gates.map((gate) => <div key={gate} className="flex items-center justify-between text-xs"><span className="text-muted-foreground">{gate}</span><CheckCircle2 className="size-4 text-emerald-400" /></div>)}<div className="mt-4 rounded-xl border border-amber-400/20 bg-amber-400/5 p-4"><p className="text-xs font-medium text-amber-200">Activation remains human-gated</p><p className="mt-1 text-[11px] leading-5 text-muted-foreground">The importing service cannot approve its own release, and approval cannot waive a failed gate.</p></div><Button disabled className="w-full">Awaiting data-release approver</Button></CardContent></Card></div></>; }
+function DataReleasesView() {
+  const [selectedId, setSelectedId] = useState(publicDatasetRegistry.sources[0].id);
+  const [enabled, setEnabled] = useState<string[]>([]);
+  const [limit, setLimit] = useState(200);
+  const [copied, setCopied] = useState(false);
+  const selected = publicDatasetRegistry.sources.find((source) => source.id === selectedId) ?? publicDatasetRegistry.sources[0];
+  const command = sourceCommand(selected, limit);
+  const canEnable = selected.status === 'ready' || selected.status === 'ready_local_results';
+
+  async function copyCommand() {
+    if (navigator.clipboard) await navigator.clipboard.writeText(command);
+    setCopied(true);
+    window.setTimeout(() => setCopied(false), 1500);
+  }
+
+  function toggleSource() {
+    setEnabled((current) => current.includes(selected.id) ? current.filter((id) => id !== selected.id) : [...current, selected.id]);
+  }
+
+  return <>
+    <PageHeading eyebrow="Dataset supply chain" title="Connect reviewed public evidence." description="Choose a source at runtime, inspect its immutable pin and licence, then run an explicit local import. Network access and activation stay off by default." action={<Badge variant="outline" className="border-cyan-400/25 bg-cyan-400/8 text-cyan-300"><CloudDownload /> Optional integrations</Badge>} />
+    <div className="grid gap-5 xl:grid-cols-[minmax(340px,.75fr)_minmax(0,1.25fr)]">
+      <Card className="surface-card"><CardHeader className="border-b border-white/8 pb-4"><p className="eyebrow">Public source registry</p><CardTitle>{enabled.length} enabled for this session</CardTitle></CardHeader><CardContent className="space-y-2 pt-4">
+        {publicDatasetRegistry.sources.map((source) => {
+          const active = selectedId === source.id;
+          const on = enabled.includes(source.id);
+          return <button type="button" aria-label={`Inspect ${source.name}`} key={source.id} onClick={() => { setSelectedId(source.id); setCopied(false); }} className={`w-full rounded-xl border p-3 text-left transition ${active ? 'border-cyan-400/35 bg-cyan-400/6' : 'border-white/7 bg-white/[0.015] hover:bg-white/[0.035]'}`}>
+            <div className="flex items-start justify-between gap-3"><div><p className="text-xs font-medium">{source.name}</p><p className="mt-1 font-mono text-[10px] text-muted-foreground">{source.id}</p></div><Badge variant="outline" className={on ? 'border-emerald-400/25 text-emerald-300' : 'border-white/10 text-muted-foreground'}>{on ? 'ENABLED' : `P${source.priority}`}</Badge></div>
+            <div className="mt-3 flex flex-wrap gap-1.5"><Badge variant="outline" className="border-white/8 text-[10px] text-muted-foreground">{source.lane.replaceAll('_', ' ')}</Badge><Badge variant="outline" className="border-white/8 text-[10px] text-muted-foreground">{source.integration.replaceAll('_', ' ')}</Badge></div>
+          </button>;
+        })}
+      </CardContent></Card>
+
+      <div className="grid gap-5">
+        <Card className="surface-card"><CardHeader className="border-b border-white/8 pb-4"><div className="flex items-start justify-between gap-3"><div><p className="eyebrow">Integration plan</p><CardTitle className="mt-1">{selected.name}</CardTitle></div><a href={selected.source_url} target="_blank" rel="noreferrer" aria-label={`Open ${selected.name} source`} className="rounded-lg border border-white/10 p-2 text-muted-foreground hover:text-foreground"><ExternalLink className="size-4" /></a></div></CardHeader><CardContent className="pt-5">
+          <div className="grid gap-3 sm:grid-cols-3"><ResultFact label="Revision" value={selected.revision} /><ResultFact label="Licence" value={selected.license} /><ResultFact label="Mode" value={selected.integration.replaceAll('_', ' ')} /></div>
+          {selected.integration === 'direct_import' && <label className="mt-5 block text-xs font-medium text-muted-foreground">Maximum cases · {limit.toLocaleString()}<input aria-label="Maximum imported cases" type="range" min="25" max="1000" step="25" value={limit} onChange={(event) => setLimit(Number(event.target.value))} className="mt-3 w-full accent-cyan-400" /></label>}
+          <div className={`mt-5 rounded-xl border p-4 ${canEnable ? 'border-cyan-400/20 bg-cyan-400/5' : 'border-amber-400/20 bg-amber-400/5'}`}><p className="text-xs font-medium">{canEnable ? 'Ready for explicit local integration' : 'Review required before raw-content import'}</p><p className="mt-1 text-[11px] leading-5 text-muted-foreground">{selected.integration === 'direct_import' ? 'The runner fetches only pinned data files, verifies SHA-256, redacts detected identifiers, writes raw bytes to quarantine, and creates a pending-review release.' : selected.integration === 'result_adapter' ? 'SentinelForge accepts recorded benchmark results only. It never installs or executes AgentDojo inside the gateway.' : 'Inspect the manifest, provide an immutable revision and approved licence decision, then add a source-specific parser before enabling.'}</p></div>
+          <div className="mt-4 rounded-xl border border-white/8 bg-black/25 p-3"><p className="eyebrow">Run locally</p><code className="mt-2 block overflow-x-auto whitespace-nowrap font-mono text-[11px] text-cyan-200">{command}</code></div>
+          <div className="mt-4 flex flex-wrap gap-2"><Button onClick={toggleSource} disabled={!canEnable} className="bg-cyan-400 text-slate-950 hover:bg-cyan-300">{enabled.includes(selected.id) ? <Check /> : <CloudDownload />}{enabled.includes(selected.id) ? 'Enabled for session' : 'Enable option'}</Button><Button variant="outline" onClick={copyCommand}>{copied ? <Check /> : <Copy />}{copied ? 'Copied' : 'Copy command'}</Button></div>
+        </CardContent></Card>
+
+        <Card className="surface-card"><CardHeader className="border-b border-white/8 pb-4"><p className="eyebrow">Non-negotiable controls</p><CardTitle>Import does not mean activation</CardTitle></CardHeader><CardContent className="grid gap-3 pt-4 sm:grid-cols-2">{['Network disabled unless --network is present', 'Licence acceptance required per import', 'External holdout excluded from training', 'Human review required before activation'].map((control) => <div key={control} className="flex items-start gap-2 rounded-lg border border-white/7 p-3 text-xs text-muted-foreground"><CheckCircle2 className="mt-0.5 size-3.5 shrink-0 text-emerald-400" />{control}</div>)}</CardContent></Card>
+      </div>
+    </div>
+  </>;
+}
 
 function Metric({ icon: Icon, label, value, detail, tone }: { icon: typeof ShieldCheck; label: string; value: string; detail: string; tone: 'cyan' | 'rose' | 'emerald' | 'amber' }) { return <Card className="surface-card" size="sm"><CardContent className="flex items-start gap-3"><div className={`metric-icon metric-${tone}`}><Icon className="size-4" /></div><div className="min-w-0"><p className="text-xs text-muted-foreground">{label}</p><p className="mt-1 text-xl font-semibold tracking-[-0.03em]">{value}</p><p className="mt-1 truncate text-[11px] text-muted-foreground">{detail}</p></div></CardContent></Card>; }
 function ResultFact({ label, value }: { label: string; value: string }) { return <div className="rounded-lg border border-white/6 bg-white/[0.025] p-3"><p className="text-[10px] uppercase tracking-[0.14em] text-muted-foreground">{label}</p><p className="mt-1.5 truncate text-xs font-medium">{value}</p></div>; }
