@@ -24,6 +24,18 @@ test('fails closed when no route fits the cost budget', () => {
   assert.deepEqual(decide({ ...scenarioRequests['public-summary'], maxCostUsd: 0.00001 }).reasonCodes, ['NO_COMPLIANT_ROUTE']);
 });
 
+test('fails closed when a custom request has no content', () => {
+  const result = decide({ ...scenarioRequests['public-summary'], prompt: '   ' });
+  assert.equal(result.outcome, 'DENY');
+  assert.deepEqual(result.reasonCodes, ['EMPTY_PROMPT']);
+});
+
+test('custom request controls produce allow, approval, and deny outcomes', () => {
+  assert.equal(decide({ ...scenarioRequests['public-summary'], prompt: 'Explain this public changelog.' }).outcome, 'ALLOW');
+  assert.equal(decide({ ...scenarioRequests['public-summary'], prompt: 'Restart the demo service.', requestedTools: ['restart_service'] }).outcome, 'REQUIRE_APPROVAL');
+  assert.equal(decide({ ...scenarioRequests['public-summary'], prompt: 'Send this result.', requestedTools: ['http_post'] }).outcome, 'DENY');
+});
+
 test('approval is exact-bound and one-time', () => {
   const decision = decide(scenarioRequests['elevated-tool']);
   const approval = createApproval(decision, 'security-approver', 1000);

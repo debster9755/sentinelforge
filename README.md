@@ -90,6 +90,8 @@ npm run build
 
 ## Demo flow
 
+For the complete presenter-ready walkthrough—including exact inputs, success/deny contrasts, expected routes, reason codes, approval replay, and public-dataset controls—use [`docs/DEMO_SCRIPT.md`](docs/DEMO_SCRIPT.md).
+
 1. On **Overview**, replay a public summary and see `fake-small` selected.
 2. Replay a complex architecture request and see `fake-strong` selected.
 3. Replay indirect injection or secret extraction and see denial before any provider call.

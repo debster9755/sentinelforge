@@ -5,7 +5,7 @@ import { Activity, ArrowRight, Check, CheckCircle2, ChevronDown, CircleDollarSig
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
-import { consumeApproval, createApproval, decide, evaluationRows, scenarioRequests, type ApprovalRecord, type Decision } from '@/lib/gateway';
+import { consumeApproval, createApproval, decide, evaluationRows, scenarioRequests, type ApprovalRecord, type Decision, type GatewayRequest } from '@/lib/gateway';
 import { publicDatasetRegistry, sourceCommand } from '@/lib/public-datasets';
 
 const scenarios = [
@@ -15,6 +15,7 @@ const scenarios = [
   { id: 'elevated-tool', label: 'Elevated tool call' },
   { id: 'secret-exfiltration', label: 'Secret exfiltration' },
   { id: 'budget-abuse', label: 'Denial of wallet' },
+  { id: 'custom', label: 'Custom request' },
 ];
 
 const navItems = [[LayoutDashboard, 'Overview'], [ShieldCheck, 'Gateway'], [FileCheck2, 'Policies'], [Activity, 'Evaluations'], [GitBranch, 'Data releases']] as const;
@@ -22,16 +23,36 @@ const navItems = [[LayoutDashboard, 'Overview'], [ShieldCheck, 'Gateway'], [File
 export function SentinelConsole() {
   const [activeView, setActiveView] = useState('Overview');
   const [scenarioId, setScenarioId] = useState(scenarios[0].id);
+  const [draftPrompt, setDraftPrompt] = useState(scenarioRequests['public-summary'].prompt);
+  const [sensitivity, setSensitivity] = useState<GatewayRequest['sensitivity']>(scenarioRequests['public-summary'].sensitivity);
+  const [qualityFloor, setQualityFloor] = useState(scenarioRequests['public-summary'].qualityFloor);
+  const [maxCostUsd, setMaxCostUsd] = useState(scenarioRequests['public-summary'].maxCostUsd);
+  const [requestedTool, setRequestedTool] = useState(scenarioRequests['public-summary'].requestedTools[0] ?? '');
+  const [inputError, setInputError] = useState('');
   const [result, setResult] = useState<Decision>(() => decide(scenarioRequests['public-summary']));
   const [running, setRunning] = useState(false);
   const selected = scenarios.find((item) => item.id === scenarioId) ?? scenarios[0];
-  const selectedRequest = scenarioRequests[selected.id];
   const allowed = result.outcome === 'ALLOW';
   const denied = result.outcome === 'DENY';
 
+  function loadScenario(id: string) {
+    setScenarioId(id);
+    const request = id === 'custom' ? { ...scenarioRequests['public-summary'], prompt: '' } : scenarioRequests[id];
+    setDraftPrompt(request.prompt);
+    setSensitivity(request.sensitivity);
+    setQualityFloor(request.qualityFloor);
+    setMaxCostUsd(request.maxCostUsd);
+    setRequestedTool(request.requestedTools[0] ?? '');
+    setInputError('');
+  }
+
   function runScenario() {
+    if (!draftPrompt.trim()) { setInputError('Enter a request payload before running the gateway.'); return; }
+    const base = scenarioId === 'custom' ? scenarioRequests['public-summary'] : scenarioRequests[selected.id];
+    const request: GatewayRequest = { ...base, requestId: `req-live-${Date.now()}`, prompt: draftPrompt, sensitivity, qualityFloor, maxCostUsd, requestedTools: requestedTool ? [requestedTool] : [] };
+    setInputError('');
     setRunning(true);
-    window.setTimeout(() => { setResult(decide(selectedRequest)); setRunning(false); }, 520);
+    window.setTimeout(() => { setResult(decide(request)); setRunning(false); }, 520);
   }
 
   return (
@@ -74,13 +95,20 @@ export function SentinelConsole() {
 
           <div className="grid gap-5 xl:grid-cols-[minmax(0,1.35fr)_minmax(330px,.65fr)]">
             <Card className="surface-card min-h-[450px]">
-              <CardHeader className="border-b border-white/8 pb-4"><div className="flex flex-wrap items-center justify-between gap-3"><div><p className="eyebrow">Decision workbench</p><CardTitle className="mt-1 text-lg">Replay a gateway scenario</CardTitle></div><Badge variant="outline" className="border-white/10 bg-white/4 text-muted-foreground"><Sparkles />Zero-key simulation</Badge></div></CardHeader>
+              <CardHeader className="border-b border-white/8 pb-4"><div className="flex flex-wrap items-center justify-between gap-3"><div><p className="eyebrow">Decision workbench</p><CardTitle className="mt-1 text-lg">Test a gateway request</CardTitle></div><Badge variant="outline" className="border-white/10 bg-white/4 text-muted-foreground"><Sparkles />Editable · zero-key</Badge></div></CardHeader>
               <CardContent className="pt-5">
                 <div className="grid gap-3 md:grid-cols-[210px_minmax(0,1fr)]">
-                  <label className="text-xs font-medium text-muted-foreground">Scenario<div className="relative mt-2"><select value={scenarioId} onChange={(event) => setScenarioId(event.target.value)} className="field-control w-full appearance-none pr-9">{scenarios.map((scenario) => <option key={scenario.id} value={scenario.id}>{scenario.label}</option>)}</select><ChevronDown className="pointer-events-none absolute right-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" /></div></label>
-                  <label className="text-xs font-medium text-muted-foreground">Request payload<textarea className="field-control mt-2 min-h-24 w-full resize-none font-mono text-[12px] leading-5" value={selectedRequest.prompt} readOnly /></label>
+                  <label className="text-xs font-medium text-muted-foreground">Start from a scenario<div className="relative mt-2"><select value={scenarioId} onChange={(event) => loadScenario(event.target.value)} className="field-control w-full appearance-none pr-9">{scenarios.map((scenario) => <option key={scenario.id} value={scenario.id}>{scenario.label}</option>)}</select><ChevronDown className="pointer-events-none absolute right-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" /></div></label>
+                  <label className="text-xs font-medium text-muted-foreground">Request payload<textarea aria-label="Request payload" className="field-control mt-2 min-h-24 w-full resize-y font-mono text-[12px] leading-5" value={draftPrompt} onChange={(event) => { setDraftPrompt(event.target.value); setInputError(''); }} placeholder="Type or paste a request to inspect…" /></label>
                 </div>
-                <div className="mt-4 flex flex-wrap items-center justify-between gap-3"><p className="text-xs text-muted-foreground"><LockKeyhole className="mr-1.5 inline size-3.5" />Prompt content is never written to audit logs.</p><Button onClick={runScenario} disabled={running} className="bg-cyan-400 text-slate-950 hover:bg-cyan-300"><Play className="size-3.5 fill-current" />{running ? 'Evaluating…' : 'Run through gateway'}</Button></div>
+                <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+                  <label className="text-xs font-medium text-muted-foreground">Sensitivity<select aria-label="Sensitivity" value={sensitivity} onChange={(event) => setSensitivity(event.target.value as GatewayRequest['sensitivity'])} className="field-control mt-2 w-full"><option value="public">Public</option><option value="internal">Internal</option><option value="confidential">Confidential</option><option value="restricted">Restricted</option></select></label>
+                  <label className="text-xs font-medium text-muted-foreground">Requested tool<select aria-label="Requested tool" value={requestedTool} onChange={(event) => setRequestedTool(event.target.value)} className="field-control mt-2 w-full"><option value="">None</option><option value="restart_service">restart_service · approval</option><option value="http_post">http_post · denied</option><option value="delete_index">delete_index · denied</option></select></label>
+                  <label className="text-xs font-medium text-muted-foreground">Quality floor<select aria-label="Quality floor" value={qualityFloor} onChange={(event) => setQualityFloor(Number(event.target.value))} className="field-control mt-2 w-full"><option value="0.7">0.70 · small eligible</option><option value="0.8">0.80 · medium+</option><option value="0.92">0.92 · strong only</option><option value="0.97">0.97 · no route</option></select></label>
+                  <label className="text-xs font-medium text-muted-foreground">Max cost (USD)<input aria-label="Maximum cost in USD" type="number" min="0" step="0.0001" value={maxCostUsd} onChange={(event) => setMaxCostUsd(Number(event.target.value))} className="field-control mt-2 w-full" /></label>
+                </div>
+                {inputError && <p role="alert" className="mt-3 text-xs text-rose-300">{inputError}</p>}
+                <div className="mt-4 flex flex-wrap items-center justify-between gap-3"><p className="text-xs text-muted-foreground"><LockKeyhole className="mr-1.5 inline size-3.5" />Prompt content is never written to audit logs.</p><div className="flex gap-2"><Button variant="outline" onClick={() => loadScenario(scenarioId)} disabled={running}><RotateCcw className="size-3.5" />Reset</Button><Button onClick={runScenario} disabled={running} className="bg-cyan-400 text-slate-950 hover:bg-cyan-300"><Play className="size-3.5 fill-current" />{running ? 'Evaluating…' : 'Run through gateway'}</Button></div></div>
                 <div className="mt-6 rounded-xl border border-white/8 bg-black/20 p-4" aria-live="polite">
                   <div className="flex flex-wrap items-center justify-between gap-3"><div className="flex items-center gap-2"><div className={`grid size-8 place-items-center rounded-lg ${allowed ? 'bg-emerald-400/12 text-emerald-300' : denied ? 'bg-rose-400/12 text-rose-300' : 'bg-amber-400/12 text-amber-300'}`}>{allowed ? <CheckCircle2 className="size-4" /> : denied ? <ShieldX className="size-4" /> : <LockKeyhole className="size-4" />}</div><div><p className="text-[10px] uppercase tracking-[0.16em] text-muted-foreground">Policy outcome</p><p className="font-mono text-sm font-semibold">{running ? 'EVALUATING' : result.outcome}</p></div></div><span className="font-mono text-[11px] text-muted-foreground">{result.decisionId}</span></div>
                   <div className="mt-4 grid gap-3 sm:grid-cols-3"><ResultFact label="Selected route" value={running ? '—' : result.selectedRoute ?? 'No provider called'} /><ResultFact label="Estimated cost" value={running ? '—' : `$${result.estimatedCostUsd.toFixed(4)}`} /><ResultFact label="Gateway latency" value={running ? '—' : `${result.gatewayLatencyMs} ms`} /></div>

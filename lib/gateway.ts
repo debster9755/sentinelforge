@@ -62,6 +62,7 @@ export function decide(request: GatewayRequest, policyVersion = '1.4.2'): Decisi
   const requestHash = stableHash(normalized);
   const base = { decisionId: `dec_${requestHash}`, requestId: request.requestId, requestHash, policyVersion, contentLogged: false as const };
 
+  if (!request.prompt.trim()) return { ...base, outcome: 'DENY', reasonCodes: ['EMPTY_PROMPT'], selectedRoute: null, estimatedCostUsd: 0, gatewayLatencyMs: 3 };
   if (request.prompt.length > 10_000) return { ...base, outcome: 'DENY', reasonCodes: ['INPUT_SIZE_LIMIT'], selectedRoute: null, estimatedCostUsd: 0, gatewayLatencyMs: 7 };
   if (injectionSignals.some((signal) => signal.test(request.prompt))) return { ...base, outcome: 'DENY', reasonCodes: ['INDIRECT_INJECTION', 'EXFILTRATION_INTENT'], selectedRoute: null, estimatedCostUsd: 0, gatewayLatencyMs: 12 };
   if (secretSignals.some((signal) => signal.test(request.prompt))) return { ...base, outcome: 'DENY', reasonCodes: ['SECRET_EXTRACTION', 'RESTRICTED_DATA'], selectedRoute: null, estimatedCostUsd: 0, gatewayLatencyMs: 9 };
