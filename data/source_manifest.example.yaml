@@ -1,0 +1,80 @@
+schema_version: 1.0.0
+registry_owner: sentinel-forge-maintainers
+default_enabled: false
+sources:
+  - source_id: databricks-dolly-15k
+    enabled: false
+    owner: sentinel-forge-maintainers
+    last_reviewed_at: 2026-09-02
+    transport: huggingface
+    uri: https://huggingface.co/datasets/databricks/databricks-dolly-15k
+    revision: REPLACE_WITH_IMMUTABLE_REVISION
+    subset: train
+    expected_content_sha256: REPLACE_WITH_64_HEX_SHA256
+    importer: dolly_v1
+    canonical_schema_version: 1.0.0
+    allowed_uses:
+      - development
+      - benign_regression
+    license_records:
+      - component: dataset
+        license_id: CC-BY-SA-3.0
+        attribution_required: true
+    content_risk: untrusted_text
+    target_split: train
+    review_status: pending
+
+  - source_id: microsoft-bipia
+    enabled: false
+    owner: sentinel-forge-maintainers
+    last_reviewed_at: 2026-09-02
+    transport: git
+    uri: https://github.com/microsoft/BIPIA
+    revision: REPLACE_WITH_COMMIT_SHA
+    subset: test
+    expected_content_sha256: REPLACE_WITH_64_HEX_SHA256
+    importer: bipia_v1
+    canonical_schema_version: 1.0.0
+    allowed_uses:
+      - external_evaluation
+    license_records:
+      - component: repository_code
+        license_id: MIT
+        attribution_required: true
+      - component: benchmark_dependencies
+        license_id: MIXED_REVIEW_REQUIRED
+        attribution_required: true
+    content_risk: adversarial_untrusted_text
+    target_split: external_holdout
+    review_status: pending
+
+  - source_id: ethz-agentdojo
+    enabled: false
+    owner: sentinel-forge-maintainers
+    last_reviewed_at: 2026-09-02
+    transport: git
+    uri: https://github.com/ethz-spylab/agentdojo
+    revision: REPLACE_WITH_RELEASE_OR_COMMIT
+    subset: benchmark_suite
+    expected_content_sha256: REPLACE_WITH_64_HEX_SHA256
+    importer: agentdojo_adapter_v1
+    canonical_schema_version: 1.0.0
+    allowed_uses:
+      - external_evaluation
+    license_records:
+      - component: repository
+        license_id: MIT
+        attribution_required: true
+    content_risk: executable_benchmark_and_adversarial_text
+    target_split: external_holdout
+    review_status: pending
+
+release_policy:
+  require_immutable_revision: true
+  require_checksum: true
+  require_license_review: true
+  require_privacy_scan: true
+  require_near_duplicate_scan: true
+  require_stratified_human_review: true
+  allow_network_in_ci: false
+  allow_source_code_execution_during_import: false

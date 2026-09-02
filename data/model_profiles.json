@@ -1,0 +1,5 @@
+[
+  {"model_id":"fake-small","provider":"local","quality_tier":1,"context_tokens":8192,"input_cost_per_million":0.20,"output_cost_per_million":0.60,"p50_latency_ms":180,"regions":["local"],"supports_tools":false},
+  {"model_id":"fake-medium","provider":"local","quality_tier":2,"context_tokens":16384,"input_cost_per_million":0.80,"output_cost_per_million":2.00,"p50_latency_ms":420,"regions":["local"],"supports_tools":true},
+  {"model_id":"fake-strong","provider":"local","quality_tier":3,"context_tokens":32768,"input_cost_per_million":3.00,"output_cost_per_million":9.00,"p50_latency_ms":950,"regions":["local"],"supports_tools":true}
+]

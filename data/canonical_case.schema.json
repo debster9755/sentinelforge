@@ -1,0 +1,94 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sentinelforge.local/schemas/canonical-case-1.0.0.json",
+  "title": "SentinelForge Canonical Evaluation Case",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "case_id", "source", "split", "channel", "payload", "policy_context", "labels", "privacy"],
+  "properties": {
+    "schema_version": {"const": "1.0.0"},
+    "case_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{2,127}$"},
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["dataset", "revision", "license_id", "content_sha256"],
+      "properties": {
+        "dataset": {"type": "string", "minLength": 1, "maxLength": 128},
+        "revision": {"type": "string", "minLength": 1, "maxLength": 128},
+        "original_id": {"type": ["string", "null"], "maxLength": 256},
+        "license_id": {"type": "string", "minLength": 1, "maxLength": 128},
+        "content_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+      }
+    },
+    "split": {"enum": ["train", "validation", "test", "external_holdout", "security_private"]},
+    "channel": {"enum": ["user_prompt", "retrieved_content", "tool_output", "model_output", "multimodal"]},
+    "payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["messages", "requested_tools"],
+      "properties": {
+        "messages": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 32,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["role", "content"],
+            "properties": {
+              "role": {"enum": ["system", "user", "assistant", "tool"]},
+              "content": {"type": "string", "maxLength": 100000}
+            }
+          }
+        },
+        "untrusted_content": {"type": ["string", "null"], "maxLength": 500000},
+        "requested_tools": {
+          "type": "array",
+          "uniqueItems": true,
+          "maxItems": 32,
+          "items": {"type": "string", "pattern": "^[a-zA-Z0-9._:-]{1,128}$"}
+        }
+      }
+    },
+    "policy_context": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tenant_id", "app_id", "subject_id", "roles", "sensitivity", "region", "quality_floor", "latency_slo_ms", "max_cost_usd"],
+      "properties": {
+        "tenant_id": {"type": "string", "minLength": 1, "maxLength": 128},
+        "app_id": {"type": "string", "minLength": 1, "maxLength": 128},
+        "subject_id": {"type": "string", "minLength": 1, "maxLength": 128},
+        "roles": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "maxLength": 128}},
+        "sensitivity": {"enum": ["public", "internal", "confidential", "restricted"]},
+        "region": {"type": "string", "minLength": 1, "maxLength": 64},
+        "quality_floor": {"type": "number", "minimum": 0, "maximum": 1},
+        "latency_slo_ms": {"type": "integer", "minimum": 1, "maximum": 300000},
+        "max_cost_usd": {"type": "number", "minimum": 0, "maximum": 1000}
+      }
+    },
+    "labels": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["case_type", "attack_families", "expected_decision", "expected_tool_calls", "minimum_quality_tier", "label_method", "review_status"],
+      "properties": {
+        "case_type": {"enum": ["benign", "attack", "malformed", "performance", "failure_injection"]},
+        "attack_families": {"type": "array", "uniqueItems": true, "items": {"type": "string", "maxLength": 128}},
+        "expected_decision": {"enum": ["ALLOW", "DENY", "REQUIRE_APPROVAL", "ALLOW_WITH_ROUTE_CONSTRAINTS"]},
+        "expected_tool_calls": {"type": "array", "uniqueItems": true, "items": {"type": "string", "maxLength": 128}},
+        "minimum_quality_tier": {"type": "integer", "minimum": 1, "maximum": 3},
+        "label_method": {"enum": ["source_truth", "policy_template", "human_review", "policy_template_plus_human_review"]},
+        "review_status": {"enum": ["pending", "approved", "rejected", "adjudication_required"]}
+      }
+    },
+    "privacy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["contains_real_pii", "contains_canary", "redaction_status"],
+      "properties": {
+        "contains_real_pii": {"const": false},
+        "contains_canary": {"type": "boolean"},
+        "redaction_status": {"enum": ["not_required", "redacted", "quarantined"]}
+      }
+    }
+  }
+}
