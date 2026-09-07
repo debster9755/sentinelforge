@@ -1,12 +1,35 @@
-import { decide, type GatewayRequest, type Sensitivity } from '@/lib/policy-engine';
+import { decide, type ApprovalRecord, type Decision, type GatewayRequest, type Sensitivity } from '@/lib/policy-engine';
 import { loadProviderConfig, listAvailableModels, streamFromProvider } from '@/lib/providers';
 
-type ChatBody = Partial<GatewayRequest> & { prompt: string; modelId?: string };
+type ChatBody = Partial<GatewayRequest> & { prompt: string; modelId?: string; approval?: ApprovalRecord };
 
 const VALID_SENSITIVITY: Sensitivity[] = ['public', 'internal', 'confidential', 'restricted'];
 
 function errorResponse(code: string, message: string, status: number, decisionId: string | null = null) {
   return Response.json({ error: { code, message, decision_id: decisionId, retryable: false } }, { status });
+}
+
+// Approval ids consumed by this route, this server process. Not a durable
+// store (see README → Known limitations → "Client-side approval demo") —
+// it exists so a REQUIRE_APPROVAL request can't be replayed against
+// /api/chat twice within one `npm run dev` session, even if a caller
+// resends an already-used approval record.
+const consumedApprovalIds = new Set<string>();
+
+/** Server-side gate for a REQUIRE_APPROVAL decision: the human must have
+ * approved *this exact* request (matching decisionId + requestHash), the
+ * client must have already run it through `consumeApproval()` once
+ * (`consumedAt` set), it must not be expired, and it must not already have
+ * been redeemed against this route. Returns null when the approval clears
+ * every check, otherwise a human-readable reason it didn't. */
+function rejectApproval(approval: ApprovalRecord | undefined, decision: Decision): string | null {
+  if (!approval) return 'Approval is required before a REQUIRE_APPROVAL request can be executed.';
+  if (approval.outcome !== 'APPROVED') return 'Approval was not granted.';
+  if (approval.decisionId !== decision.decisionId || approval.requestHash !== decision.requestHash) return 'Approval does not match this exact request.';
+  if (!approval.consumedAt) return 'Approval must be executed once by the client before it is sent to the gateway.';
+  if (approval.expiresAt <= Date.now()) return 'Approval has expired.';
+  if (consumedApprovalIds.has(approval.approvalId)) return 'Approval already redeemed once — replay blocked.';
+  return null;
 }
 
 // POST /api/chat — policy decision first, model call second. This is the
@@ -42,7 +65,20 @@ export async function POST(request: Request) {
   const decision = decide(gatewayRequest, models);
 
   if (decision.outcome === 'DENY') return errorResponse('POLICY_DENIED', 'Request cannot be processed under the active policy.', 403, decision.decisionId);
-  if (decision.outcome === 'REQUIRE_APPROVAL') return Response.json({ decision }, { status: 202 });
+
+  if (decision.outcome === 'REQUIRE_APPROVAL') {
+    // No approval attached at all is the normal first call for this
+    // outcome — hand the decision back so the caller can route it to a
+    // human, same as before this endpoint understood approvals.
+    if (!body.approval) return Response.json({ decision }, { status: 202 });
+    const reason = rejectApproval(body.approval, decision);
+    if (reason) return errorResponse('APPROVAL_INVALID', reason, 403, decision.decisionId);
+    consumedApprovalIds.add(body.approval.approvalId);
+    // Falls through to the ALLOW routing/streaming path below — an
+    // approved REQUIRE_APPROVAL decision already carries a `selectedRoute`
+    // (policy-engine.ts computes routing for both outcomes), so nothing
+    // else here needs to know the difference.
+  }
 
   const modelId = body.modelId ?? decision.selectedRoute;
   if (!modelId) return errorResponse('NO_COMPLIANT_ROUTE', 'Policy allowed the request but no route was selected.', 502, decision.decisionId);

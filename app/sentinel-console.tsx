@@ -87,6 +87,7 @@ export function SentinelConsole() {
   const [running, setRunning] = useState(false);
   const [offline, setOffline] = useState(false);
   const [approval, setApproval] = useState<ApprovalRecord | null>(null);
+  const [approvalRejected, setApprovalRejected] = useState(false);
   const [approvalStatus, setApprovalStatus] = useState('');
   const [output, setOutput] = useState('');
   const [outputError, setOutputError] = useState('');
@@ -96,6 +97,10 @@ export function SentinelConsole() {
   const allowed = result?.outcome === 'ALLOW';
   const denied = result?.outcome === 'DENY';
   const requiresApproval = result?.outcome === 'REQUIRE_APPROVAL';
+  // "Generate with local model" unlocks for a plain ALLOW immediately, and
+  // for REQUIRE_APPROVAL only once "Approve & execute once" has been
+  // clicked — never for "Do not approve" or an undecided approval prompt.
+  const canGenerate = allowed || (requiresApproval && approval !== null);
 
   function loadScenario(id: string) {
     setScenarioId(id);
@@ -108,6 +113,7 @@ export function SentinelConsole() {
     setInputError('');
     setResult(null);
     setApproval(null);
+    setApprovalRejected(false);
     setApprovalStatus('');
     setOutput('');
     setOutputError('');
@@ -118,6 +124,7 @@ export function SentinelConsole() {
     setInputError('');
     setRunning(true);
     setApproval(null);
+    setApprovalRejected(false);
     setApprovalStatus('');
     setOutput('');
     setOutputError('');
@@ -129,12 +136,37 @@ export function SentinelConsole() {
   }
 
   async function generateOutput() {
-    if (!result || result.outcome !== 'ALLOW') return;
+    if (!result || !canGenerate) return;
+
+    // For a REQUIRE_APPROVAL decision, the approval is spent right here, at
+    // the moment generation is actually requested — not when it was granted.
+    // That's what makes "Approve & execute once" mean once: the consumed
+    // record (with its nonce marked used) is what gets sent to /api/chat,
+    // which independently verifies it before calling a model.
+    let approvalPayload: ApprovalRecord | undefined;
+    if (result.outcome === 'REQUIRE_APPROVAL') {
+      if (!approval) return;
+      try {
+        const consumed = consumeApproval(approval, result);
+        setApproval(consumed);
+        setApprovalStatus('Executed once · approval is now consumed');
+        approvalPayload = consumed;
+      } catch (error) {
+        setApprovalStatus(error instanceof Error ? error.message : 'Approval could not be consumed');
+        return;
+      }
+    }
+
     setStreaming(true);
     setOutput('');
     setOutputError('');
     try {
-      const res = await fetch('/api/chat', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ prompt: draftPrompt, sensitivity, qualityFloor, maxCostUsd, requestedTools: requestedTool ? [requestedTool] : [] }) });
+      // Reuse the exact requestId /api/decide already returned on `result`.
+      // /api/chat re-runs decide() independently (see chat/route.ts) rather
+      // than trusting the client's verdict — without the same requestId
+      // that second call would mint its own, produce a different
+      // requestHash, and a real approval could never match it.
+      const res = await fetch('/api/chat', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ requestId: result.requestId, prompt: draftPrompt, sensitivity, qualityFloor, maxCostUsd, requestedTools: requestedTool ? [requestedTool] : [], ...(approvalPayload ? { approval: approvalPayload } : {}) }) });
       if (!res.ok || !res.body) {
         const body = (await res.json().catch(() => null)) as { error?: { message?: string } } | null;
         setOutputError(body?.error?.message ?? `Gateway returned ${res.status}.`);
@@ -166,15 +198,34 @@ export function SentinelConsole() {
     }
   }
 
-  function approveAndConsume() {
+  /** "Approved & execute once" — grants the approval but does NOT spend it.
+   * The nonce is only consumed inside generateOutput(), the moment a model
+   * is actually about to be called. This just unlocks that button. */
+  function approveRequest() {
     if (!result) return;
-    try { const created = createApproval(result, 'security-approver'); const consumed = consumeApproval(created, result); setApproval(consumed); setApprovalStatus('Executed once · approval is now consumed'); }
-    catch (error) { setApprovalStatus(error instanceof Error ? error.message : 'Approval failed'); }
+    setApprovalRejected(false);
+    try {
+      const created = createApproval(result, 'security-approver');
+      setApproval(created);
+      setApprovalStatus('Approved · click "Generate with local model" to execute once');
+    } catch (error) {
+      setApprovalStatus(error instanceof Error ? error.message : 'Approval failed');
+    }
   }
 
+  /** "Do not approve" — the request stops here. "Generate with local model" never unlocks. */
+  function rejectRequest() {
+    setApproval(null);
+    setApprovalRejected(true);
+    setApprovalStatus('Not approved · this request will not be executed');
+  }
+
+  /** Demonstrates the one-time nonce actually working: re-consuming an
+   * already-spent approval is expected to throw. */
   function replayApproval() {
     if (!approval || !result) return;
-    try { consumeApproval(approval, result); } catch (error) { setApprovalStatus(error instanceof Error ? error.message : 'Replay blocked'); }
+    try { consumeApproval(approval, result); setApprovalStatus('Unexpected: replay succeeded'); }
+    catch (error) { setApprovalStatus(error instanceof Error ? error.message : 'Replay blocked'); }
   }
 
   return (
@@ -238,10 +289,19 @@ export function SentinelConsole() {
                   <div className="mt-4 flex flex-wrap gap-1.5">{result.reasonCodes.map((reason) => <Badge key={reason} variant="outline" className="border-white/10 bg-white/[0.035] font-mono text-[10px] text-muted-foreground">{reason}</Badge>)}</div>
                   {result.hits.length > 0 && <div className="mt-4"><p className="eyebrow mb-2">Matched signals</p><AnnotatedPrompt prompt={draftPrompt} hits={result.hits} /></div>}
 
-                  {requiresApproval && <div className="mt-4 rounded-xl border border-amber-400/20 bg-amber-400/5 p-4"><p className="text-sm font-medium">Exact-scope approval required</p><p className="mt-1 text-xs leading-5 text-muted-foreground">Binds tenant, request hash, tool, arguments, expiry, and one-time nonce.</p><div className="mt-3 flex gap-2"><Button size="sm" onClick={approveAndConsume} className="bg-amber-300 text-slate-950 hover:bg-amber-200">Approve & execute once</Button>{approval && <Button size="sm" variant="outline" onClick={replayApproval}><RotateCcw />Replay approval</Button>}</div>{approvalStatus && <p className={`mt-3 text-xs ${approvalStatus.toLowerCase().includes('blocked') ? 'text-rose-300' : 'text-emerald-300'}`}>{approvalStatus}</p>}</div>}
+                  {requiresApproval && <div className="mt-4 rounded-xl border border-amber-400/20 bg-amber-400/5 p-4">
+                    <p className="text-sm font-medium">Exact-scope approval required</p>
+                    <p className="mt-1 text-xs leading-5 text-muted-foreground">Binds tenant, request hash, tool, arguments, expiry, and one-time nonce.</p>
+                    {!approval && !approvalRejected && <div className="mt-3 flex flex-wrap gap-2">
+                      <Button size="sm" onClick={approveRequest} className="bg-amber-300 text-slate-950 hover:bg-amber-200"><Check className="size-3.5" />Approve &amp; execute once</Button>
+                      <Button size="sm" variant="outline" onClick={rejectRequest}><ShieldX className="size-3.5" />Do not approve</Button>
+                    </div>}
+                    {approval?.consumedAt != null && <div className="mt-3"><Button size="sm" variant="outline" onClick={replayApproval}><RotateCcw className="size-3.5" />Replay approval (should be blocked)</Button></div>}
+                    {approvalStatus && <p className={`mt-3 text-xs ${approvalStatus.toLowerCase().includes('blocked') || approvalStatus.toLowerCase().includes('not approved') || approvalStatus.toLowerCase().includes('failed') ? 'text-rose-300' : 'text-emerald-300'}`}>{approvalStatus}</p>}
+                  </div>}
 
-                  {allowed && <div className="mt-4 rounded-xl border border-cyan-400/15 bg-cyan-400/[0.03] p-4">
-                    <div className="flex flex-wrap items-center justify-between gap-2"><p className="text-sm font-medium">Local model output</p><Button size="sm" onClick={generateOutput} disabled={streaming} className="bg-cyan-400 text-slate-950 hover:bg-cyan-300"><Play className="size-3.5 fill-current" />{streaming ? 'Generating…' : 'Generate with local model'}</Button></div>
+                  {canGenerate && <div className="mt-4 rounded-xl border border-cyan-400/15 bg-cyan-400/[0.03] p-4">
+                    <div className="flex flex-wrap items-center justify-between gap-2"><p className="text-sm font-medium">Local model output</p><Button size="sm" onClick={generateOutput} disabled={streaming || (requiresApproval && approval?.consumedAt != null)} className="bg-cyan-400 text-slate-950 hover:bg-cyan-300"><Play className="size-3.5 fill-current" />{streaming ? 'Generating…' : requiresApproval && approval?.consumedAt != null ? 'Executed once' : 'Generate with local model'}</Button></div>
                     {outputError && <p className="mt-2 text-xs text-rose-300">{outputError}</p>}
                     {(output || streaming) && <pre className="mt-3 max-h-64 overflow-auto whitespace-pre-wrap rounded-lg border border-white/8 bg-black/30 p-3 font-mono text-[12px] leading-5">{output}{streaming && <span className="animate-pulse">▍</span>}</pre>}
                   </div>}
