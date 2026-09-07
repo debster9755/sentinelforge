@@ -535,16 +535,23 @@ Honest gaps, so nobody mistakes this for a hardened production gateway:
 > $\color{orange}{\textsf{The policy engine answers in 7 to 15 ms no matter how starved the machine is.}}$
 > $\color{orange}{\textsf{Only token generation is affected by free memory.}}$
 
-Every number below was measured on a **16 GB Apple M2 with roughly 100 MB free** — a deliberately memory-starved worst case, with Ollama, the dev server, and an editor all resident:
+Every number below was measured on a **16 GB Apple M2 with roughly 100 MB free** — a deliberately memory-starved worst case, with Ollama, the dev server, and an editor all resident.
 
-| Stage | Model | State | Measured | Demo-safe? |
-|---|---|---|---:|:--:|
-| `POST /api/decide` (policy only) | — none — | any | **7–15 ms** | ✅ always |
-| `GET /api/models` (provider probe) | — none — | any | **~17 ms** | ✅ always |
-| `POST /api/chat` (generation) | `qwen3:4b` | cold | **11 s** | ✅ |
-| `POST /api/chat` (generation) | `qwen3:4b` | warm | **21 s** · 138 tokens | ✅ |
-| `POST /api/chat` (generation) | `qwen3:14b` | warm | **44 s** · even for a one-word answer | ⚠️ |
-| `POST /api/chat` (generation) | `qwen3:14b` | **cold** | **901 s (≈15 min)** · 9.6 GB load | ❌ |
+**Cold vs warm start.** A *cold* start means the model's weights are not in memory: before a single token can be produced, Ollama must read several GB off SSD, allocate GPU/unified memory, and build the KV cache. A *warm* start means the weights are already resident from a recent request (Ollama holds them for `keep_alive`, 5 minutes by default), so generation begins immediately. The figures below therefore report **time to first token (TTFT)**, which isolates that load cost — total request time also depends on how many tokens the answer happens to contain, which would otherwise confound the comparison.
+
+| Stage | Model | State | Time to first token | Total | Demo-safe? |
+|---|---|---|---:|---:|:--:|
+| `POST /api/decide` (policy only) | — none — | any | — | **7–15 ms** | ✅ always |
+| `GET /api/models` (provider probe) | — none — | any | — | **~17 ms** | ✅ always |
+| `POST /api/chat` | `qwen3:4b` (3.2 GB) | **cold** | **13.9 s** | 15.3 s | ✅ |
+| `POST /api/chat` | `qwen3:4b` (3.2 GB) | warm | **2.4 – 10.9 s** | 3.7 – 12.2 s | ✅ |
+| `POST /api/chat` | `qwen3:14b` (9.6 GB) | warm | — | **~44 s** | ⚠️ |
+| `POST /api/chat` | `qwen3:14b` (9.6 GB) | **cold** | — | **901 s (≈15 min)** | ❌ |
+
+The four `qwen3:4b` runs used an identical prompt returning 39–42 tokens, so they are directly comparable: **cold costs roughly 11.5 s of pure model loading** before inference starts. The `qwen3:14b` rows used longer prompts and are not directly comparable to the 4b rows — they are listed to show the order of magnitude when a 9.6 GB model is loaded onto a 16 GB host that must page to make room.
+
+> [!NOTE]
+> **Warm does not mean *predictable* on a starved host.** The four warm `qwen3:4b` runs above ranged from 2.4 s to 10.9 s — a 4.5× spread for identical work. On a machine with free memory, warm TTFT is typically well under a second and consistent. Here it isn't, because "resident" doesn't mean "untouched": with ~139 MB free and 4.7 GB compressed, macOS keeps compressing and re-faulting pages even for a nominally loaded model. Pre-warming still helps a great deal — it just doesn't buy you predictability until you free some memory.
 
 Both `qwen3:14b` runs returned the correct result and routed to `ROUTE_QWEN3_14B` exactly as documented — this is a *speed* constraint on the host, never a correctness one.
 
@@ -552,7 +559,7 @@ Both `qwen3:14b` runs returned the correct result and routed to `ROUTE_QWEN3_14B
 
 1. **Demo generation on `qwen3:4b` only.** Pre-warm it immediately before presenting so the first request isn't a cold load:
    ```bash
-   ollama run qwen3:4b "hi"        # ~10s once, then it's resident
+   ollama run qwen3:4b "hi"        # pays the ~12s load cost once, then it's resident
    ```
 2. **Keep the warmed model resident** for the length of the session, so it isn't evicted between slides:
    ```bash
