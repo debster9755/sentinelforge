@@ -180,13 +180,43 @@ Open **Overview → Decision workbench**. Choose a preset or select **Custom req
 
 ## 📊 Routing profiles
 
+Three static, network-free reference profiles are always available as a fallback, priced from [`data/model_profiles.json`](data/model_profiles.json):
+
 | Profile | Quality | Estimated cost | Latency | Tool support | Typical use |
 |---|---:|---:|---:|:---:|---|
-| 🩵 `fake-small` | `0.76` | `$0.0002` | `180 ms` | — | Simple public summaries |
-| 💜 `fake-medium` | `0.86` | `$0.0007` | `420 ms` | ✅ | Moderate tasks and approved tools |
-| 🟡 `fake-strong` | `0.96` | `$0.0028` | `950 ms` | ✅ | High-quality architecture analysis |
+| 🩵 `fake-small` | `0.76` | `$0.00034` | `180 ms` | — | Simple public summaries |
+| 💜 `fake-medium` | `0.86` | `$0.00124` | `420 ms` | ✅ | Moderate tasks and approved tools |
+| 🟡 `fake-strong` | `0.96` | `$0.0051` | `950 ms` | ✅ | High-quality architecture analysis |
 
-The names are deliberately explicit: these are **fake local profiles**, not calls to commercial models.
+The names are deliberately explicit: on their own, these are **fake local profiles**, not calls to any model.
+
+### 🧠 Real models take over automatically — the Qwen3 tier mapping
+
+If you have the Qwen3 family pulled via Ollama (`ollama pull qwen3:4b/8b/14b` — check with `ls ~/.ollama/models/manifests/registry.ollama.ai/library/qwen3`), [`lib/providers.ts`](lib/providers.ts) ships a **built-in tier mapping** that steps each one directly into the matching fake slot, with no configuration required:
+
+| Static profile | Quality tier | → replaced live by | Same quality | Live cost |
+|---|:---:|---|:---:|---:|
+| `fake-small` | 1 (`0.76`) | **`qwen3:4b`** | ✅ `0.76` | `$0` |
+| `fake-medium` | 2 (`0.86`) | **`qwen3:8b`** | ✅ `0.86` | `$0` |
+| `fake-strong` | 3 (`0.96`) | **`qwen3:14b`** | ✅ `0.96` | `$0` |
+
+This isn't a name-based special case in the routing algorithm — it's just accurate tier data for three specific model tags, registered as `DEFAULT_MODEL_HINTS` in `lib/providers.ts`. The existing cost/latency/quality scoring in [`selectRoute()`](lib/policy-engine.ts) does the rest: a live model's cost defaults to `$0`, so whenever a request's quality floor resolves to "the medium tier," `qwen3:8b` (quality `0.86`, cost `$0`) beats `fake-medium` (quality `0.86`, cost `$0.00124`) on price and wins automatically. No `fake-*` profile is ever hardcoded out — if Ollama isn't running, or a tag isn't pulled, the static equivalent quietly serves that tier instead.
+
+Verified end-to-end against a running Ollama with all three tags pulled:
+
+```text
+qualityFloor 0.70, no tool   → ALLOW  → qwen3:4b   → $0   (was: fake-small)
+qualityFloor 0.80, + tool    → REQUIRE_APPROVAL → qwen3:8b  → $0   (was: fake-medium)
+qualityFloor 0.92            → ALLOW  → qwen3:14b  → $0   (was: fake-strong)
+```
+
+Override any tag's tier/quality/latency, or map a different model entirely, via `SENTINEL_MODEL_HINTS` (env values take precedence over the built-in Qwen3 defaults):
+
+```bash
+SENTINEL_MODEL_HINTS='{"qwen3:8b":{"tier":3,"quality":0.9,"latency":300}}'
+```
+
+Covered by [`tests/providers.test.ts`](tests/providers.test.ts) (6 tests: each tag maps to the right tier/quality/cost, an unrecognized model falls back to the generic size heuristic instead of a Qwen3 default, and an env override wins over the built-in mapping).
 
 ## 🌍 Optional public datasets
 

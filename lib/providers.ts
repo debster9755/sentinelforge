@@ -76,13 +76,31 @@ async function probeProvider(provider: ProviderConfig, timeoutMs = 1500): Promis
   }
 }
 
+type ModelHint = { quality?: number; tier?: 1 | 2 | 3; cost?: number; latency?: number };
+
+// Built-in tier mapping for the Qwen3 family pulled via `ollama pull`. This is
+// what makes qwen3:4b / qwen3:8b / qwen3:14b step directly into the
+// fake-small / fake-medium / fake-strong slots: matching each model's quality
+// to the corresponding static tier (0.76 / 0.86 / 0.96) means a request that
+// used to need "the medium tier" now needs "quality >= 0.86" — satisfied by
+// qwen3:8b — and since a live model's cost defaults to $0, it always beats
+// the static profile of the same tier on cost. No name-based special case in
+// the routing algorithm itself; this is just accurate tier data for models we
+// know about. Override any entry (or add your own) via SENTINEL_MODEL_HINTS —
+// env values win over these defaults.
+const DEFAULT_MODEL_HINTS: Record<string, ModelHint> = {
+  'qwen3:4b': { tier: 1, quality: 0.76, latency: 220 }, // -> replaces fake-small
+  'qwen3:8b': { tier: 2, quality: 0.86, latency: 480 }, // -> replaces fake-medium
+  'qwen3:14b': { tier: 3, quality: 0.96, latency: 900 }, // -> replaces fake-strong
+};
+
 // Heuristic quality/cost estimate for a live local model we have no pricing
 // data for. Local inference cost is a compute proxy, not a real invoice —
 // see docs/SPEC.md's routing algorithm note on this. Adjust
 // SENTINEL_MODEL_HINTS (JSON: { "<substring>": { quality, tier, cost, latency } })
-// to override any model by name.
-function modelToProfile(provider: ProviderConfig, modelId: string): ModelProfile {
-  const hints = loadModelHints();
+// to override any model by name, including the Qwen3 defaults above.
+export function modelToProfile(provider: ProviderConfig, modelId: string): ModelProfile {
+  const hints: Record<string, ModelHint> = { ...DEFAULT_MODEL_HINTS, ...loadModelHints() };
   const hint = Object.entries(hints).find(([key]) => modelId.toLowerCase().includes(key.toLowerCase()))?.[1];
   const sizeMatch = modelId.match(/(\d+(?:\.\d+)?)\s*b\b/i);
   const paramsB = sizeMatch ? Number(sizeMatch[1]) : undefined;
@@ -100,7 +118,7 @@ function modelToProfile(provider: ProviderConfig, modelId: string): ModelProfile
   };
 }
 
-function loadModelHints(): Record<string, { quality?: number; tier?: 1 | 2 | 3; cost?: number; latency?: number }> {
+function loadModelHints(): Record<string, ModelHint> {
   const raw = process.env.SENTINEL_MODEL_HINTS;
   if (!raw) return {};
   try {
