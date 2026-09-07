@@ -148,18 +148,24 @@ export async function listAvailableModels(providers: ProviderConfig[] = loadProv
 
 export type ChatChunk = { delta: string; done: boolean; usage?: { promptTokens: number; completionTokens: number } };
 
-/** Streams a chat completion from whichever provider currently serves `modelId`. Throws if no configured provider reports that model. */
-export async function* streamChat(modelId: string, prompt: string, providers: ProviderConfig[] = loadProviderConfig()): AsyncGenerator<ChatChunk> {
-  const health = await discoverProviders(providers);
-  const owner = health.find((p) => p.online && p.models.includes(modelId));
-  if (!owner) throw new Error(`No online local provider currently serves model "${modelId}".`);
-
-  const res = await fetch(`${owner.baseUrl}/chat/completions`, {
+/**
+ * Streams a chat completion from a known provider base URL. Prefer this over
+ * `streamChat()` whenever the caller already knows which provider serves the
+ * model (e.g. from an earlier `listAvailableModels()`/`discoverProviders()`
+ * call) — it makes exactly one outbound request instead of re-probing every
+ * configured provider first. Route handlers that call this from inside a
+ * `ReadableStream`'s `start()` (after already returning response headers)
+ * should always use this form: issuing a fresh discovery round at that point
+ * adds several redundant subrequests for no benefit, since the provider is
+ * already known.
+ */
+export async function* streamFromProvider(baseUrl: string, modelId: string, prompt: string): AsyncGenerator<ChatChunk> {
+  const res = await fetch(`${baseUrl}/chat/completions`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ model: modelId, messages: [{ role: 'user', content: prompt }], stream: true }),
   });
-  if (!res.ok || !res.body) throw new Error(`Provider ${owner.id} returned ${res.status} for model "${modelId}".`);
+  if (!res.ok || !res.body) throw new Error(`Provider at ${baseUrl} returned ${res.status} for model "${modelId}".`);
 
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
@@ -188,4 +194,12 @@ export async function* streamChat(modelId: string, prompt: string, providers: Pr
     }
   }
   yield { delta: '', done: true };
+}
+
+/** Convenience wrapper for callers that don't already know which provider serves `modelId` — runs a discovery round first, then delegates to `streamFromProvider`. Throws if no configured provider reports the model online. */
+export async function* streamChat(modelId: string, prompt: string, providers: ProviderConfig[] = loadProviderConfig()): AsyncGenerator<ChatChunk> {
+  const health = await discoverProviders(providers);
+  const owner = health.find((p) => p.online && p.models.includes(modelId));
+  if (!owner) throw new Error(`No online local provider currently serves model "${modelId}".`);
+  yield* streamFromProvider(owner.baseUrl, modelId, prompt);
 }

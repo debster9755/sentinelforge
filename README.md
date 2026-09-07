@@ -218,6 +218,9 @@ SENTINEL_MODEL_HINTS='{"qwen3:8b":{"tier":3,"quality":0.9,"latency":300}}'
 
 Covered by [`tests/providers.test.ts`](tests/providers.test.ts) (6 tests: each tag maps to the right tier/quality/cost, an unrecognized model falls back to the generic size heuristic instead of a Qwen3 default, and an env override wins over the built-in mapping).
 
+> [!NOTE]
+> Live *generation* via `/api/chat` was verified end-to-end against `qwen3:4b` — real streamed tokens, correct `decision` → `token`×N → `done` sequence. Qwen3 is a **thinking model**: it streams internal reasoning tokens before its final answer, so a trivial prompt can still take a while wall-clock, especially with several GB of RAM under pressure from other running models/apps (check `ollama ps` and free memory if a response seems slow, not stuck). `streamFromProvider()` in `lib/providers.ts` resolves the serving provider once, before the stream starts, rather than re-discovering it from inside the stream callback — a redundant round-trip removed during this verification pass.
+
 ## 🌍 Optional public datasets
 
 Public-data integrations are **off by default**. Open **Data releases** to inspect each source’s immutable revision, licence, isolation lane, integration mode, and local command.

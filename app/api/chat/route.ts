@@ -1,5 +1,5 @@
 import { decide, type GatewayRequest, type Sensitivity } from '@/lib/policy-engine';
-import { listAvailableModels, streamChat } from '@/lib/providers';
+import { loadProviderConfig, listAvailableModels, streamFromProvider } from '@/lib/providers';
 
 type ChatBody = Partial<GatewayRequest> & { prompt: string; modelId?: string };
 
@@ -52,12 +52,19 @@ export async function POST(request: Request) {
     return errorResponse('NO_LOCAL_PROVIDER', `Policy selected "${modelId}", a reference model with no live output. Start a local provider (e.g. \`ollama serve\`) or pass "modelId" for an online model.`, 503, decision.decisionId);
   }
 
+  // Resolve which provider serves modelId *now*, before the streaming
+  // Response is returned, instead of re-discovering providers from inside
+  // start() below. A model's `provider` field is the provider id (e.g.
+  // 'ollama'), set when listAvailableModels() built its ModelProfile.
+  const owningProvider = loadProviderConfig().find((p) => p.id === routedModel?.provider);
+  if (!owningProvider) return errorResponse('NO_LOCAL_PROVIDER', `No configured provider matches "${routedModel?.provider}" for model "${modelId}".`, 503, decision.decisionId);
+
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
       const encoder = new TextEncoder();
       controller.enqueue(encoder.encode(`event: decision\ndata: ${JSON.stringify(decision)}\n\n`));
       try {
-        for await (const chunk of streamChat(modelId, gatewayRequest.prompt)) {
+        for await (const chunk of streamFromProvider(owningProvider.baseUrl, modelId, gatewayRequest.prompt)) {
           if (chunk.delta) controller.enqueue(encoder.encode(`event: token\ndata: ${JSON.stringify({ delta: chunk.delta })}\n\n`));
           if (chunk.done) controller.enqueue(encoder.encode('event: done\ndata: {}\n\n'));
         }
@@ -70,5 +77,8 @@ export async function POST(request: Request) {
     },
   });
 
-  return new Response(stream, { headers: { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' } });
+  // Note: deliberately no `Connection` header — it's hop-by-hop and setting
+  // it manually can cause runtimes (workerd included) to buffer or mishandle
+  // the streaming response instead of flushing it incrementally.
+  return new Response(stream, { headers: { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' } });
 }
