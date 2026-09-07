@@ -1,5 +1,15 @@
-import { decide, type ApprovalRecord, type Decision, type GatewayRequest, type Sensitivity } from '@/lib/policy-engine';
+import { decide, selectRoute, type ApprovalRecord, type Decision, type GatewayRequest, type Sensitivity } from '@/lib/policy-engine';
 import { loadProviderConfig, listAvailableModels, streamFromProvider } from '@/lib/providers';
+
+// The lowest quality floor the console exposes ("0.70 · small eligible").
+// Once a human has approved the exact action, the elevated floor that
+// justified paying for a stronger model no longer needs to be honored for
+// *execution* — the risk decision has already been made by a person, not
+// bought with model quality. Re-routing to the cheapest model that still
+// clears this baseline keeps approval-gated requests from defaulting to
+// the most expensive compliant route just because that's what qualified
+// pre-approval.
+const POST_APPROVAL_QUALITY_FLOOR = 0.7;
 
 type ChatBody = Partial<GatewayRequest> & { prompt: string; modelId?: string; approval?: ApprovalRecord };
 
@@ -62,7 +72,7 @@ export async function POST(request: Request) {
     dataRegion: 'local',
   };
 
-  const decision = decide(gatewayRequest, models);
+  let decision = decide(gatewayRequest, models);
 
   if (decision.outcome === 'DENY') return errorResponse('POLICY_DENIED', 'Request cannot be processed under the active policy.', 403, decision.decisionId);
 
@@ -78,6 +88,17 @@ export async function POST(request: Request) {
     // approved REQUIRE_APPROVAL decision already carries a `selectedRoute`
     // (policy-engine.ts computes routing for both outcomes), so nothing
     // else here needs to know the difference.
+
+    // Cost-optimized re-route: only kicks in when the original floor
+    // actually excluded a cheaper model, and only when a cheaper one is
+    // available now. If the cheapest option is already what was selected,
+    // this is a no-op.
+    if (gatewayRequest.qualityFloor > POST_APPROVAL_QUALITY_FLOOR) {
+      const reroute = selectRoute({ ...gatewayRequest, qualityFloor: POST_APPROVAL_QUALITY_FLOOR }, models);
+      if (reroute.route && reroute.route.modelId !== decision.selectedRoute) {
+        decision = { ...decision, selectedRoute: reroute.route.modelId, estimatedCostUsd: reroute.route.cost, reasonCodes: [...decision.reasonCodes, 'POST_APPROVAL_COST_OPTIMIZED_ROUTE'] };
+      }
+    }
   }
 
   const modelId = body.modelId ?? decision.selectedRoute;
