@@ -1,11 +1,12 @@
 'use client';
 
-import { useState } from 'react';
-import { Activity, ArrowRight, Check, CheckCircle2, ChevronDown, CircleDollarSign, Clock3, CloudDownload, Command, Copy, ExternalLink, FileCheck2, Gauge, GitBranch, LayoutDashboard, LockKeyhole, Play, RotateCcw, ShieldCheck, ShieldX, Sparkles } from 'lucide-react';
+import { useEffect, useState } from 'react';
+import { Activity, AlertTriangle, Check, CheckCircle2, ChevronDown, CircleDollarSign, Clock3, CloudDownload, Command, Copy, Download, ExternalLink, FileCheck2, Gauge, GitBranch, LayoutDashboard, LockKeyhole, Play, RotateCcw, ShieldCheck, ShieldX, Sparkles, Wifi, WifiOff } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
-import { consumeApproval, createApproval, decide, evaluationRows, scenarioRequests, type ApprovalRecord, type Decision, type GatewayRequest } from '@/lib/gateway';
+import { appendAuditEntry, clearAuditLog, loadAuditLog, toAuditEntry, toJsonl, type AuditEntry } from '@/lib/audit-log';
+import { consumeApproval, createApproval, decide, evaluationRows, scenarioRequests, type ApprovalRecord, type Decision, type GatewayRequest, type ModelProfile, type RuleHit } from '@/lib/gateway';
 import { publicDatasetRegistry, sourceCommand } from '@/lib/public-datasets';
 
 const scenarios = [
@@ -15,10 +16,63 @@ const scenarios = [
   { id: 'elevated-tool', label: 'Elevated tool call' },
   { id: 'secret-exfiltration', label: 'Secret exfiltration' },
   { id: 'budget-abuse', label: 'Denial of wallet' },
+  { id: 'confidential-tool-combo', label: 'Confidential + tool (soft signal)' },
   { id: 'custom', label: 'Custom request' },
 ];
 
+const CUSTOM_DEFAULTS: Pick<GatewayRequest, 'role' | 'tenantId' | 'appId' | 'sensitivity' | 'qualityFloor' | 'maxCostUsd'> = {
+  role: 'developer',
+  tenantId: 'acme-demo',
+  appId: 'custom-request',
+  sensitivity: 'internal',
+  qualityFloor: 0.7,
+  maxCostUsd: 0.01,
+};
+
 const navItems = [[LayoutDashboard, 'Overview'], [ShieldCheck, 'Gateway'], [FileCheck2, 'Policies'], [Activity, 'Evaluations'], [GitBranch, 'Data releases']] as const;
+
+type ProviderHealth = { id: string; label: string; baseUrl: string; online: boolean; models: string[] };
+type ModelsResponse = { providers: ProviderHealth[]; models: ModelProfile[] };
+
+/** Shared local-model discovery, used by the workbench and the Gateway lab so both panels agree on what's actually running. */
+function useLocalModels() {
+  const [providers, setProviders] = useState<ProviderHealth[]>([]);
+  const [models, setModels] = useState<ModelProfile[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  async function refresh() {
+    setLoading(true);
+    try {
+      const res = await fetch('/api/models');
+      if (res.ok) {
+        const data: ModelsResponse = await res.json();
+        setProviders(data.providers);
+        setModels(data.models);
+      }
+    } catch {
+      // API route unreachable (static export, offline) — panels fall back to static reference models
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  // Deferred to a microtask so `refresh`'s synchronous `setLoading(true)` runs
+  // outside the effect's own call stack (the react-compiler lint flags
+  // setState called synchronously inside an effect body).
+  useEffect(() => { void Promise.resolve().then(() => refresh()); }, []);
+  return { providers, models, loading, refresh };
+}
+
+async function requestDecision(payload: Record<string, unknown>): Promise<{ decision: Decision; offline: boolean }> {
+  try {
+    const res = await fetch('/api/decide', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ...payload, useLiveModels: true }) });
+    if (res.ok) return { decision: await res.json(), offline: false };
+  } catch {
+    // fall through to local fallback below
+  }
+  const request: GatewayRequest = { requestId: `req-offline-${Date.now()}`, tenantId: 'acme-demo', appId: 'console', role: 'developer', dataRegion: 'local', prompt: '', requestedTools: [], sensitivity: 'internal', qualityFloor: 0.7, latencySloMs: 2000, maxCostUsd: 0.01, ...payload } as GatewayRequest;
+  return { decision: decide(request), offline: true };
+}
 
 export function SentinelConsole() {
   const [activeView, setActiveView] = useState('Overview');
@@ -29,30 +83,98 @@ export function SentinelConsole() {
   const [maxCostUsd, setMaxCostUsd] = useState(scenarioRequests['public-summary'].maxCostUsd);
   const [requestedTool, setRequestedTool] = useState(scenarioRequests['public-summary'].requestedTools[0] ?? '');
   const [inputError, setInputError] = useState('');
-  const [result, setResult] = useState<Decision>(() => decide(scenarioRequests['public-summary']));
+  const [result, setResult] = useState<Decision | null>(null);
   const [running, setRunning] = useState(false);
-  const selected = scenarios.find((item) => item.id === scenarioId) ?? scenarios[0];
-  const allowed = result.outcome === 'ALLOW';
-  const denied = result.outcome === 'DENY';
+  const [offline, setOffline] = useState(false);
+  const [approval, setApproval] = useState<ApprovalRecord | null>(null);
+  const [approvalStatus, setApprovalStatus] = useState('');
+  const [output, setOutput] = useState('');
+  const [outputError, setOutputError] = useState('');
+  const [streaming, setStreaming] = useState(false);
+  const [auditLog, setAuditLog] = useState<AuditEntry[]>(() => loadAuditLog());
+  const { providers, models, loading: modelsLoading, refresh: refreshModels } = useLocalModels();
+  const allowed = result?.outcome === 'ALLOW';
+  const denied = result?.outcome === 'DENY';
+  const requiresApproval = result?.outcome === 'REQUIRE_APPROVAL';
 
   function loadScenario(id: string) {
     setScenarioId(id);
-    const request = id === 'custom' ? { ...scenarioRequests['public-summary'], prompt: '' } : scenarioRequests[id];
+    const request = id === 'custom' ? { ...scenarioRequests['public-summary'], ...CUSTOM_DEFAULTS, prompt: '', requestedTools: [] } : scenarioRequests[id];
     setDraftPrompt(request.prompt);
     setSensitivity(request.sensitivity);
     setQualityFloor(request.qualityFloor);
     setMaxCostUsd(request.maxCostUsd);
     setRequestedTool(request.requestedTools[0] ?? '');
     setInputError('');
+    setResult(null);
+    setApproval(null);
+    setApprovalStatus('');
+    setOutput('');
+    setOutputError('');
   }
 
-  function runScenario() {
+  async function runScenario() {
     if (!draftPrompt.trim()) { setInputError('Enter a request payload before running the gateway.'); return; }
-    const base = scenarioId === 'custom' ? scenarioRequests['public-summary'] : scenarioRequests[selected.id];
-    const request: GatewayRequest = { ...base, requestId: `req-live-${Date.now()}`, prompt: draftPrompt, sensitivity, qualityFloor, maxCostUsd, requestedTools: requestedTool ? [requestedTool] : [] };
     setInputError('');
     setRunning(true);
-    window.setTimeout(() => { setResult(decide(request)); setRunning(false); }, 520);
+    setApproval(null);
+    setApprovalStatus('');
+    setOutput('');
+    setOutputError('');
+    const { decision, offline: isOffline } = await requestDecision({ prompt: draftPrompt, sensitivity, qualityFloor, maxCostUsd, requestedTools: requestedTool ? [requestedTool] : [] });
+    setResult(decision);
+    setOffline(isOffline);
+    setAuditLog(appendAuditEntry(toAuditEntry(decision, draftPrompt)));
+    setRunning(false);
+  }
+
+  async function generateOutput() {
+    if (!result || result.outcome !== 'ALLOW') return;
+    setStreaming(true);
+    setOutput('');
+    setOutputError('');
+    try {
+      const res = await fetch('/api/chat', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ prompt: draftPrompt, sensitivity, qualityFloor, maxCostUsd, requestedTools: requestedTool ? [requestedTool] : [] }) });
+      if (!res.ok || !res.body) {
+        const body = (await res.json().catch(() => null)) as { error?: { message?: string } } | null;
+        setOutputError(body?.error?.message ?? `Gateway returned ${res.status}.`);
+        return;
+      }
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const frames = buffer.split('\n\n');
+        buffer = frames.pop() ?? '';
+        for (const frame of frames) {
+          const eventLine = frame.split('\n').find((line) => line.startsWith('event:'));
+          const dataLine = frame.split('\n').find((line) => line.startsWith('data:'));
+          if (!dataLine) continue;
+          const event = eventLine?.slice(6).trim() ?? 'message';
+          const data = JSON.parse(dataLine.slice(5).trim());
+          if (event === 'token') setOutput((current) => current + data.delta);
+          if (event === 'error') setOutputError(data.message);
+        }
+      }
+    } catch {
+      setOutputError('Could not reach the local model provider. Is Ollama or LM Studio running?');
+    } finally {
+      setStreaming(false);
+    }
+  }
+
+  function approveAndConsume() {
+    if (!result) return;
+    try { const created = createApproval(result, 'security-approver'); const consumed = consumeApproval(created, result); setApproval(consumed); setApprovalStatus('Executed once · approval is now consumed'); }
+    catch (error) { setApprovalStatus(error instanceof Error ? error.message : 'Approval failed'); }
+  }
+
+  function replayApproval() {
+    if (!approval || !result) return;
+    try { consumeApproval(approval, result); } catch (error) { setApprovalStatus(error instanceof Error ? error.message : 'Replay blocked'); }
   }
 
   return (
@@ -64,7 +186,7 @@ export function SentinelConsole() {
             <div><p className="font-heading text-[15px] font-semibold tracking-[-0.02em]">SentinelForge</p><p className="text-[10px] font-medium uppercase tracking-[0.18em] text-muted-foreground">AI control plane</p></div>
           </div>
           <div className="ml-auto flex items-center gap-2">
-            <Badge variant="outline" className="hidden border-emerald-500/25 bg-emerald-500/8 text-emerald-300 sm:inline-flex"><span className="size-1.5 rounded-full bg-emerald-400" /> All systems nominal</Badge>
+            <ProviderBadge providers={providers} loading={modelsLoading} />
             <Button variant="outline" size="sm" className="border-white/10 bg-white/4"><Command className="size-3.5" /><span className="hidden sm:inline">Command</span></Button>
             <div className="grid size-8 place-items-center rounded-full border border-cyan-400/25 bg-cyan-400/10 text-xs font-semibold text-cyan-200">DR</div>
           </div>
@@ -76,30 +198,30 @@ export function SentinelConsole() {
           <nav aria-label="Primary navigation" className="space-y-1">
             {navItems.map(([Icon, label]) => <button key={label} onClick={() => setActiveView(label)} className={`nav-item ${activeView === label ? 'nav-item-active' : ''}`} type="button"><Icon className="size-4" aria-hidden="true" />{label}</button>)}
           </nav>
-          <div className="mt-8 px-2"><p className="eyebrow">Active policy</p><div className="mt-3 rounded-xl border border-white/8 bg-white/[0.025] p-3"><div className="flex items-center justify-between text-xs font-medium"><span>enterprise-default</span><Badge variant="outline" className="border-cyan-400/20 text-cyan-300">v1.4.2</Badge></div><p className="mt-2 text-[11px] leading-5 text-muted-foreground">18 rules · content logging off · local region</p></div></div>
+          <div className="mt-8 px-2"><p className="eyebrow">Active policy</p><div className="mt-3 rounded-xl border border-white/8 bg-white/[0.025] p-3"><div className="flex items-center justify-between text-xs font-medium"><span>enterprise-default</span><Badge variant="outline" className="border-cyan-400/20 text-cyan-300">v2.0.0</Badge></div><p className="mt-2 text-[11px] leading-5 text-muted-foreground">Scored risk engine · 3-way outcome · local region</p></div></div>
         </aside>
 
         <section className="min-w-0 px-4 py-6 sm:px-6 lg:px-8 lg:py-8">
           {activeView !== 'Overview' ? <FeatureView view={activeView} onNavigate={setActiveView} /> : <>
           <div className="mb-7 flex flex-wrap items-end justify-between gap-4">
-            <div><div className="mb-2 flex items-center gap-2"><span className="h-px w-6 bg-cyan-400" /><p className="eyebrow text-cyan-300">Live operations</p></div><h1 className="font-heading text-2xl font-semibold tracking-[-0.035em] sm:text-3xl">Security posture, spend control.</h1><p className="mt-2 max-w-2xl text-sm text-muted-foreground">Every model request is authenticated, inspected, policy-bound, and routed to the least expensive compliant model.</p></div>
-            <div className="flex items-center gap-2 text-xs text-muted-foreground"><Clock3 className="size-3.5" />Updated 8 seconds ago</div>
+            <div><div className="mb-2 flex items-center gap-2"><span className="h-px w-6 bg-cyan-400" /><p className="eyebrow text-cyan-300">Live operations</p></div><h1 className="font-heading text-2xl font-semibold tracking-[-0.035em] sm:text-3xl">Security posture, spend control.</h1><p className="mt-2 max-w-2xl text-sm text-muted-foreground">Every request is scored for risk, resolved to ALLOW / REQUIRE_APPROVAL / DENY, and only then routed to the least expensive compliant model.</p></div>
+            <div className="flex items-center gap-2 text-xs text-muted-foreground"><Clock3 className="size-3.5" />{auditLog[0] ? `Last decision ${new Date(auditLog[0].timestamp).toLocaleTimeString()}` : 'No decisions this session'}</div>
           </div>
 
           <div className="mb-5 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-            <Metric icon={ShieldCheck} label="Protected requests" value="12,842" detail="99.18% allowed safely" tone="cyan" />
-            <Metric icon={ShieldX} label="Threats blocked" value="104" detail="+16% vs prior window" tone="rose" />
-            <Metric icon={CircleDollarSign} label="Cost avoided" value="$1,284" detail="34.2% below baseline" tone="emerald" />
-            <Metric icon={Gauge} label="Gateway p95" value="68 ms" detail="52 ms under SLO" tone="amber" />
+            <Metric icon={ShieldCheck} label="Session decisions" value={String(auditLog.length)} detail="this browser session · localStorage" tone="cyan" />
+            <Metric icon={ShieldX} label="Threats blocked" value={String(auditLog.filter((e) => e.outcome === 'DENY').length)} detail="DENY outcomes this session" tone="rose" />
+            <Metric icon={AlertTriangle} label="Escalated to human" value={String(auditLog.filter((e) => e.outcome === 'REQUIRE_APPROVAL').length)} detail="REQUIRE_APPROVAL outcomes" tone="amber" />
+            <Metric icon={CircleDollarSign} label="Spend, this session" value={`$${auditLog.reduce((sum, e) => sum + e.estimatedCostUsd, 0).toFixed(4)}`} detail="estimated across allowed requests" tone="emerald" />
           </div>
 
           <div className="grid gap-5 xl:grid-cols-[minmax(0,1.35fr)_minmax(330px,.65fr)]">
             <Card className="surface-card min-h-[450px]">
-              <CardHeader className="border-b border-white/8 pb-4"><div className="flex flex-wrap items-center justify-between gap-3"><div><p className="eyebrow">Decision workbench</p><CardTitle className="mt-1 text-lg">Test a gateway request</CardTitle></div><Badge variant="outline" className="border-white/10 bg-white/4 text-muted-foreground"><Sparkles />Editable · zero-key</Badge></div></CardHeader>
+              <CardHeader className="border-b border-white/8 pb-4"><div className="flex flex-wrap items-center justify-between gap-3"><div><p className="eyebrow">Decision workbench</p><CardTitle className="mt-1 text-lg">Test a gateway request</CardTitle></div><Badge variant="outline" className="border-white/10 bg-white/4 text-muted-foreground"><Sparkles />Scored engine · live routing</Badge></div></CardHeader>
               <CardContent className="pt-5">
                 <div className="grid gap-3 md:grid-cols-[210px_minmax(0,1fr)]">
                   <label className="text-xs font-medium text-muted-foreground">Start from a scenario<div className="relative mt-2"><select value={scenarioId} onChange={(event) => loadScenario(event.target.value)} className="field-control w-full appearance-none pr-9">{scenarios.map((scenario) => <option key={scenario.id} value={scenario.id}>{scenario.label}</option>)}</select><ChevronDown className="pointer-events-none absolute right-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" /></div></label>
-                  <label className="text-xs font-medium text-muted-foreground">Request payload<textarea aria-label="Request payload" className="field-control mt-2 min-h-24 w-full resize-y font-mono text-[12px] leading-5" value={draftPrompt} onChange={(event) => { setDraftPrompt(event.target.value); setInputError(''); }} placeholder="Type or paste a request to inspect…" /></label>
+                  <label className="text-xs font-medium text-muted-foreground">Request payload<textarea aria-label="Request payload" className="field-control mt-2 min-h-24 w-full resize-y font-mono text-[12px] leading-5" value={draftPrompt} onChange={(event) => { setDraftPrompt(event.target.value); setInputError(''); }} placeholder="Type or paste any request to inspect…" /></label>
                 </div>
                 <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
                   <label className="text-xs font-medium text-muted-foreground">Sensitivity<select aria-label="Sensitivity" value={sensitivity} onChange={(event) => setSensitivity(event.target.value as GatewayRequest['sensitivity'])} className="field-control mt-2 w-full"><option value="public">Public</option><option value="internal">Internal</option><option value="confidential">Confidential</option><option value="restricted">Restricted</option></select></label>
@@ -108,24 +230,96 @@ export function SentinelConsole() {
                   <label className="text-xs font-medium text-muted-foreground">Max cost (USD)<input aria-label="Maximum cost in USD" type="number" min="0" step="0.0001" value={maxCostUsd} onChange={(event) => setMaxCostUsd(Number(event.target.value))} className="field-control mt-2 w-full" /></label>
                 </div>
                 {inputError && <p role="alert" className="mt-3 text-xs text-rose-300">{inputError}</p>}
-                <div className="mt-4 flex flex-wrap items-center justify-between gap-3"><p className="text-xs text-muted-foreground"><LockKeyhole className="mr-1.5 inline size-3.5" />Prompt content is never written to audit logs.</p><div className="flex gap-2"><Button variant="outline" onClick={() => loadScenario(scenarioId)} disabled={running}><RotateCcw className="size-3.5" />Reset</Button><Button onClick={runScenario} disabled={running} className="bg-cyan-400 text-slate-950 hover:bg-cyan-300"><Play className="size-3.5 fill-current" />{running ? 'Evaluating…' : 'Run through gateway'}</Button></div></div>
-                <div className="mt-6 rounded-xl border border-white/8 bg-black/20 p-4" aria-live="polite">
-                  <div className="flex flex-wrap items-center justify-between gap-3"><div className="flex items-center gap-2"><div className={`grid size-8 place-items-center rounded-lg ${allowed ? 'bg-emerald-400/12 text-emerald-300' : denied ? 'bg-rose-400/12 text-rose-300' : 'bg-amber-400/12 text-amber-300'}`}>{allowed ? <CheckCircle2 className="size-4" /> : denied ? <ShieldX className="size-4" /> : <LockKeyhole className="size-4" />}</div><div><p className="text-[10px] uppercase tracking-[0.16em] text-muted-foreground">Policy outcome</p><p className="font-mono text-sm font-semibold">{running ? 'EVALUATING' : result.outcome}</p></div></div><span className="font-mono text-[11px] text-muted-foreground">{result.decisionId}</span></div>
-                  <div className="mt-4 grid gap-3 sm:grid-cols-3"><ResultFact label="Selected route" value={running ? '—' : result.selectedRoute ?? 'No provider called'} /><ResultFact label="Estimated cost" value={running ? '—' : `$${result.estimatedCostUsd.toFixed(4)}`} /><ResultFact label="Gateway latency" value={running ? '—' : `${result.gatewayLatencyMs} ms`} /></div>
-                  <div className="mt-4 flex flex-wrap gap-1.5">{!running && result.reasonCodes.map((reason) => <Badge key={reason} variant="outline" className="border-white/10 bg-white/[0.035] font-mono text-[10px] text-muted-foreground">{reason}</Badge>)}</div>
-                </div>
+                <div className="mt-4 flex flex-wrap items-center justify-between gap-3"><p className="text-xs text-muted-foreground"><LockKeyhole className="mr-1.5 inline size-3.5" />Prompt content is never written to audit logs — only a 60-char preview.</p><div className="flex gap-2"><Button variant="outline" onClick={() => loadScenario(scenarioId)} disabled={running}><RotateCcw className="size-3.5" />Reset</Button><Button onClick={runScenario} disabled={running} className="bg-cyan-400 text-slate-950 hover:bg-cyan-300"><Play className="size-3.5 fill-current" />{running ? 'Evaluating…' : 'Run through gateway'}</Button></div></div>
+
+                {result && <div className="mt-6 rounded-xl border border-white/8 bg-black/20 p-4" aria-live="polite">
+                  <div className="flex flex-wrap items-center justify-between gap-3"><div className="flex items-center gap-2"><div className={`grid size-8 place-items-center rounded-lg ${allowed ? 'bg-emerald-400/12 text-emerald-300' : denied ? 'bg-rose-400/12 text-rose-300' : 'bg-amber-400/12 text-amber-300'}`}>{allowed ? <CheckCircle2 className="size-4" /> : denied ? <ShieldX className="size-4" /> : <AlertTriangle className="size-4" />}</div><div><p className="text-[10px] uppercase tracking-[0.16em] text-muted-foreground">Policy outcome</p><p className="font-mono text-sm font-semibold">{running ? 'EVALUATING' : result.outcome}</p></div></div><div className="text-right"><span className="font-mono text-[11px] text-muted-foreground">{result.decisionId}</span>{offline && <p className="text-[10px] text-amber-300">offline fallback · static models only</p>}</div></div>
+                  <div className="mt-4 grid gap-3 sm:grid-cols-4"><ResultFact label="Risk score" value={result.risk.toFixed(2)} /><ResultFact label="Selected route" value={result.selectedRoute ?? 'No provider called'} /><ResultFact label="Estimated cost" value={`$${result.estimatedCostUsd.toFixed(4)}`} /><ResultFact label="Gateway latency" value={`${result.gatewayLatencyMs} ms`} /></div>
+                  <div className="mt-4 flex flex-wrap gap-1.5">{result.reasonCodes.map((reason) => <Badge key={reason} variant="outline" className="border-white/10 bg-white/[0.035] font-mono text-[10px] text-muted-foreground">{reason}</Badge>)}</div>
+                  {result.hits.length > 0 && <div className="mt-4"><p className="eyebrow mb-2">Matched signals</p><AnnotatedPrompt prompt={draftPrompt} hits={result.hits} /></div>}
+
+                  {requiresApproval && <div className="mt-4 rounded-xl border border-amber-400/20 bg-amber-400/5 p-4"><p className="text-sm font-medium">Exact-scope approval required</p><p className="mt-1 text-xs leading-5 text-muted-foreground">Binds tenant, request hash, tool, arguments, expiry, and one-time nonce.</p><div className="mt-3 flex gap-2"><Button size="sm" onClick={approveAndConsume} className="bg-amber-300 text-slate-950 hover:bg-amber-200">Approve & execute once</Button>{approval && <Button size="sm" variant="outline" onClick={replayApproval}><RotateCcw />Replay approval</Button>}</div>{approvalStatus && <p className={`mt-3 text-xs ${approvalStatus.toLowerCase().includes('blocked') ? 'text-rose-300' : 'text-emerald-300'}`}>{approvalStatus}</p>}</div>}
+
+                  {allowed && <div className="mt-4 rounded-xl border border-cyan-400/15 bg-cyan-400/[0.03] p-4">
+                    <div className="flex flex-wrap items-center justify-between gap-2"><p className="text-sm font-medium">Local model output</p><Button size="sm" onClick={generateOutput} disabled={streaming} className="bg-cyan-400 text-slate-950 hover:bg-cyan-300"><Play className="size-3.5 fill-current" />{streaming ? 'Generating…' : 'Generate with local model'}</Button></div>
+                    {outputError && <p className="mt-2 text-xs text-rose-300">{outputError}</p>}
+                    {(output || streaming) && <pre className="mt-3 max-h-64 overflow-auto whitespace-pre-wrap rounded-lg border border-white/8 bg-black/30 p-3 font-mono text-[12px] leading-5">{output}{streaming && <span className="animate-pulse">▍</span>}</pre>}
+                  </div>}
+                </div>}
               </CardContent>
             </Card>
 
             <div className="grid gap-5">
-              <Card className="surface-card"><CardHeader className="border-b border-white/8 pb-4"><p className="eyebrow">Routing efficiency</p><CardTitle className="mt-1">Spend follows complexity</CardTitle></CardHeader><CardContent className="pt-5"><div className="flex items-end justify-between"><div><p className="text-3xl font-semibold tracking-tight">34.2%</p><p className="mt-1 text-xs text-muted-foreground">estimated cost reduction</p></div><Badge className="bg-emerald-400/10 text-emerald-300">Healthy</Badge></div><div className="mt-5 space-y-3"><RouteBar label="fake-small" value={63} color="bg-cyan-400" /><RouteBar label="fake-medium" value={25} color="bg-violet-400" /><RouteBar label="fake-strong" value={12} color="bg-amber-400" /></div></CardContent></Card>
-              <Card className="surface-card"><CardHeader className="border-b border-white/8 pb-4"><p className="eyebrow">Release evidence</p><CardTitle className="mt-1">All mandatory gates pass</CardTitle></CardHeader><CardContent className="space-y-3 pt-4">{['Attack recall ≥ 90%', 'Benign block ≤ 5%', 'Cross-split leakage = 0', 'Independent approval recorded'].map((gate) => <div key={gate} className="flex items-center justify-between gap-3 text-xs"><span className="text-muted-foreground">{gate}</span><CheckCircle2 className="size-4 text-emerald-400" /></div>)}<Button variant="ghost" size="sm" className="mt-1 w-full justify-between text-cyan-300 hover:bg-cyan-400/8 hover:text-cyan-200">Review evidence bundle<ArrowRight /></Button></CardContent></Card>
+              <ProvidersCard providers={providers} models={models} loading={modelsLoading} onRefresh={refreshModels} />
+              <AuditLogCard entries={auditLog} onClear={() => { clearAuditLog(); setAuditLog([]); }} />
             </div>
           </div></>}
         </section>
       </div>
     </main>
   );
+}
+
+function ProviderBadge({ providers, loading }: { providers: ProviderHealth[]; loading: boolean }) {
+  const onlineCount = providers.filter((p) => p.online).length;
+  if (loading) return <Badge variant="outline" className="hidden border-white/10 bg-white/4 text-muted-foreground sm:inline-flex">Checking local models…</Badge>;
+  return <Badge variant="outline" className={`hidden sm:inline-flex ${onlineCount ? 'border-emerald-500/25 bg-emerald-500/8 text-emerald-300' : 'border-white/10 bg-white/4 text-muted-foreground'}`}><span className={`size-1.5 rounded-full ${onlineCount ? 'bg-emerald-400' : 'bg-white/30'}`} /> {onlineCount ? `${onlineCount} local provider${onlineCount === 1 ? '' : 's'} online` : 'No local providers online'}</Badge>;
+}
+
+function ProvidersCard({ providers, models, loading, onRefresh }: { providers: ProviderHealth[]; models: ModelProfile[]; loading: boolean; onRefresh: () => void }) {
+  const liveModels = models.filter((m) => m.source === 'live');
+  return <Card className="surface-card"><CardHeader className="border-b border-white/8 pb-4"><div className="flex items-center justify-between gap-3"><div><p className="eyebrow">Local model providers</p><CardTitle className="mt-1">{liveModels.length} live model{liveModels.length === 1 ? '' : 's'} available</CardTitle></div><Button variant="ghost" size="sm" onClick={onRefresh} disabled={loading}><RotateCcw className="size-3.5" />Rescan</Button></div></CardHeader><CardContent className="space-y-2 pt-4">
+    {providers.length === 0 && <p className="text-xs text-muted-foreground">{loading ? 'Probing localhost providers…' : 'No providers configured.'}</p>}
+    {providers.map((provider) => <div key={provider.id} className="flex items-center justify-between rounded-lg border border-white/7 p-3 text-xs"><div className="flex items-center gap-2">{provider.online ? <Wifi className="size-3.5 text-emerald-400" /> : <WifiOff className="size-3.5 text-muted-foreground" />}<div><p className="font-medium">{provider.label}</p><p className="text-[10px] text-muted-foreground">{provider.baseUrl}</p></div></div><Badge variant="outline" className={provider.online ? 'border-emerald-400/25 text-emerald-300' : 'border-white/10 text-muted-foreground'}>{provider.online ? `${provider.models.length} model${provider.models.length === 1 ? '' : 's'}` : 'offline'}</Badge></div>)}
+    <p className="pt-1 text-[11px] leading-5 text-muted-foreground">Point at Ollama, LM Studio, llama.cpp server, or vLLM — anything speaking the OpenAI-compatible <code className="font-mono">/v1</code> API. Configure via <code className="font-mono">SENTINEL_PROVIDERS</code>.</p>
+  </CardContent></Card>;
+}
+
+function AuditLogCard({ entries, onClear }: { entries: AuditEntry[]; onClear: () => void }) {
+  function exportJsonl() {
+    const blob = new Blob([toJsonl(entries)], { type: 'application/x-ndjson' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `sentinelforge-audit-${Date.now()}.jsonl`;
+    link.click();
+    URL.revokeObjectURL(url);
+  }
+  return <Card className="surface-card"><CardHeader className="border-b border-white/8 pb-4"><div className="flex items-center justify-between gap-3"><div><p className="eyebrow">Session audit trail</p><CardTitle className="mt-1">{entries.length} decision{entries.length === 1 ? '' : 's'} logged</CardTitle></div><div className="flex gap-1"><Button variant="ghost" size="sm" onClick={exportJsonl} disabled={!entries.length}><Download className="size-3.5" /></Button><Button variant="ghost" size="sm" onClick={onClear} disabled={!entries.length}>Clear</Button></div></div></CardHeader><CardContent className="max-h-72 space-y-2 overflow-y-auto pt-4">
+    {entries.length === 0 && <p className="text-xs text-muted-foreground">Run a request through the gateway to start this session&apos;s trail. Stored in this browser only.</p>}
+    {entries.map((entry) => <div key={entry.decisionId} className="rounded-lg border border-white/7 p-2.5 text-[11px]"><div className="flex items-center justify-between gap-2"><Badge className={entry.outcome === 'ALLOW' ? 'bg-emerald-400/10 text-emerald-300' : entry.outcome === 'DENY' ? 'bg-rose-400/10 text-rose-300' : 'bg-amber-400/10 text-amber-300'}>{entry.outcome}</Badge><span className="font-mono text-muted-foreground">{new Date(entry.timestamp).toLocaleTimeString()}</span></div><p className="mt-1.5 truncate text-muted-foreground">{entry.promptPreview}</p></div>)}
+  </CardContent></Card>;
+}
+
+const CATEGORY_COLOR: Record<RuleHit['category'], string> = {
+  injection: 'bg-rose-400/25 text-rose-100',
+  secret: 'bg-rose-400/25 text-rose-100',
+  pii: 'bg-amber-400/25 text-amber-100',
+  budget: 'bg-violet-400/25 text-violet-100',
+  tool: 'bg-cyan-400/25 text-cyan-100',
+  sensitivity: 'bg-amber-400/25 text-amber-100',
+  input: 'bg-white/15 text-white',
+  routing: 'bg-white/15 text-white',
+};
+
+/** Renders the prompt as plain text with the exact substrings that triggered a rule highlighted, so a reader can see *which words* caused the decision instead of trusting a black-box score. */
+function AnnotatedPrompt({ prompt, hits }: { prompt: string; hits: RuleHit[] }) {
+  const spanned = hits.filter((hit): hit is RuleHit & { span: [number, number] } => hit.span !== null).sort((a, b) => a.span[0] - b.span[0]);
+  if (!spanned.length) return <ul className="space-y-1.5">{hits.map((hit) => <li key={hit.ruleId} className="flex items-start gap-2 text-xs text-muted-foreground"><Badge variant="outline" className={`shrink-0 border-white/10 text-[10px] ${CATEGORY_COLOR[hit.category]}`}>{hit.category}</Badge>{hit.message}</li>)}</ul>;
+
+  const segments: Array<{ text: string; hit: RuleHit | null }> = [];
+  let cursor = 0;
+  for (const hit of spanned) {
+    const [start, end] = hit.span;
+    if (start > cursor) segments.push({ text: prompt.slice(cursor, start), hit: null });
+    segments.push({ text: prompt.slice(start, end), hit });
+    cursor = Math.max(cursor, end);
+  }
+  if (cursor < prompt.length) segments.push({ text: prompt.slice(cursor), hit: null });
+
+  return <div className="rounded-lg border border-white/7 bg-black/25 p-3 font-mono text-[12px] leading-6">
+    {segments.map((segment, index) => segment.hit ? <mark key={index} title={segment.hit.message} className={`rounded px-0.5 ${CATEGORY_COLOR[segment.hit.category]}`}>{segment.text}</mark> : <span key={index}>{segment.text}</span>)}
+  </div>;
 }
 
 function FeatureView({ view, onNavigate }: { view: string; onNavigate: (view: string) => void }) {
@@ -146,9 +340,10 @@ function GatewayView() {
   const [decision, setDecision] = useState<Decision | null>(null);
   const [approval, setApproval] = useState<ApprovalRecord | null>(null);
   const [approvalStatus, setApprovalStatus] = useState('');
+  const { providers, models, loading } = useLocalModels();
 
   function evaluate() {
-    const next = decide({ ...scenarioRequests['public-summary'], requestId: `req-live-${Date.now()}`, prompt, qualityFloor: quality, requestedTools: prompt.toLowerCase().includes('restart') ? ['restart_service'] : [] });
+    const next = decide({ ...scenarioRequests['public-summary'], requestId: `req-live-${Date.now()}`, prompt, qualityFloor: quality, requestedTools: prompt.toLowerCase().includes('restart') ? ['restart_service'] : [] }, models.length ? models : undefined);
     setDecision(next); setApproval(null); setApprovalStatus('');
   }
 
@@ -164,19 +359,21 @@ function GatewayView() {
   }
 
   return <>
-    <PageHeading eyebrow="Gateway lab" title="Inspect a live request." description="Run arbitrary text through the deterministic guard, policy, budget, and route selection pipeline. Nothing leaves this browser." action={<Badge variant="outline" className="border-emerald-400/25 bg-emerald-400/8 text-emerald-300"><span className="size-1.5 rounded-full bg-emerald-400" /> Local only</Badge>} />
+    <PageHeading eyebrow="Gateway lab" title="Inspect a live request." description="Run arbitrary text through the deterministic guard, policy, budget, and route selection pipeline. Nothing leaves this browser except calls to your own local model providers." action={<Badge variant="outline" className="border-emerald-400/25 bg-emerald-400/8 text-emerald-300"><span className="size-1.5 rounded-full bg-emerald-400" /> Local only</Badge>} />
     <div className="grid gap-5 xl:grid-cols-[minmax(0,1.15fr)_minmax(340px,.85fr)]">
       <Card className="surface-card"><CardHeader className="border-b border-white/8 pb-4"><p className="eyebrow">OpenAI-compatible request</p><CardTitle>Request envelope</CardTitle></CardHeader><CardContent className="space-y-4 pt-5">
         <label className="block text-xs font-medium text-muted-foreground">Messages[0].content<textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} className="field-control mt-2 min-h-44 w-full resize-y font-mono text-xs leading-5" /></label>
         <div className="grid gap-3 sm:grid-cols-3"><ResultFact label="Tenant" value="acme-demo" /><ResultFact label="Region" value="local" /><ResultFact label="Max cost" value="$0.0100" /></div>
         <label className="block text-xs font-medium text-muted-foreground">Quality floor · {quality.toFixed(2)}<input aria-label="Quality floor" type="range" min="0.7" max="0.96" step="0.01" value={quality} onChange={(event) => setQuality(Number(event.target.value))} className="mt-3 w-full accent-cyan-400" /></label>
-        <Button onClick={evaluate} className="w-full bg-cyan-400 text-slate-950 hover:bg-cyan-300"><Play className="fill-current" />Evaluate request</Button>
+        <Button onClick={evaluate} disabled={loading} className="w-full bg-cyan-400 text-slate-950 hover:bg-cyan-300"><Play className="fill-current" />Evaluate request</Button>
+        <p className="text-[11px] text-muted-foreground">{providers.some((p) => p.online) ? `Routing against ${models.filter((m) => m.source === 'live').length} live local model(s).` : 'No local provider online — routing against static reference models.'}</p>
       </CardContent></Card>
       <Card className="surface-card"><CardHeader className="border-b border-white/8 pb-4"><p className="eyebrow">Decision trace</p><CardTitle>{decision ? decision.outcome : 'Awaiting request'}</CardTitle></CardHeader><CardContent className="pt-5">
         {!decision ? <div className="grid min-h-64 place-items-center rounded-xl border border-dashed border-white/10 text-center"><div><ShieldCheck className="mx-auto size-8 text-cyan-300/60" /><p className="mt-3 text-sm font-medium">No model is called before policy passes</p><p className="mt-1 text-xs text-muted-foreground">Submit the envelope to see the complete trace.</p></div></div> : <div className="space-y-4">
-          <div className={`rounded-xl border p-4 ${decision.outcome === 'DENY' ? 'border-rose-400/20 bg-rose-400/6' : decision.outcome === 'ALLOW' ? 'border-emerald-400/20 bg-emerald-400/6' : 'border-amber-400/20 bg-amber-400/6'}`}><p className="font-mono text-lg font-semibold">{decision.outcome}</p><p className="mt-1 font-mono text-[11px] text-muted-foreground">{decision.decisionId}</p></div>
+          <div className={`rounded-xl border p-4 ${decision.outcome === 'DENY' ? 'border-rose-400/20 bg-rose-400/6' : decision.outcome === 'ALLOW' ? 'border-emerald-400/20 bg-emerald-400/6' : 'border-amber-400/20 bg-amber-400/6'}`}><p className="font-mono text-lg font-semibold">{decision.outcome}</p><p className="mt-1 font-mono text-[11px] text-muted-foreground">{decision.decisionId} · risk {decision.risk.toFixed(2)}</p></div>
           <div className="grid gap-3 sm:grid-cols-2"><ResultFact label="Route" value={decision.selectedRoute ?? 'No provider called'} /><ResultFact label="Cost" value={`$${decision.estimatedCostUsd.toFixed(4)}`} /><ResultFact label="Policy" value={`v${decision.policyVersion}`} /><ResultFact label="Content logged" value="false" /></div>
           <div className="flex flex-wrap gap-1.5">{decision.reasonCodes.map((code) => <Badge key={code} variant="outline" className="border-white/10 font-mono text-[10px] text-muted-foreground">{code}</Badge>)}</div>
+          <div><p className="eyebrow mb-2">Stage timings</p><div className="space-y-1">{decision.trace.map((stage) => <div key={stage.stage} className="flex justify-between text-[11px] text-muted-foreground"><span className="font-mono">{stage.stage}</span><span>{stage.ms} ms</span></div>)}</div></div>
           {decision.outcome === 'REQUIRE_APPROVAL' && <div className="rounded-xl border border-amber-400/20 bg-amber-400/5 p-4"><p className="text-sm font-medium">Exact-scope approval required</p><p className="mt-1 text-xs leading-5 text-muted-foreground">Binds tenant, request hash, tool, arguments, expiry, and one-time nonce.</p><div className="mt-3 flex gap-2"><Button size="sm" onClick={approveAndConsume} className="bg-amber-300 text-slate-950 hover:bg-amber-200">Approve & execute once</Button>{approval && <Button size="sm" variant="outline" onClick={replay}><RotateCcw />Replay approval</Button>}</div>{approvalStatus && <p className={`mt-3 text-xs ${approvalStatus.includes('blocked') ? 'text-rose-300' : 'text-emerald-300'}`}>{approvalStatus}</p>}</div>}
         </div>}
       </CardContent></Card>
@@ -189,17 +386,18 @@ function PoliciesView() {
   const changes = candidate === 'strict' ? 28 : 7;
   return <><PageHeading eyebrow="Policy governance" title="Change policy without changing code." description="Replay sanitized decision metadata against an immutable candidate. Simulation never invokes a model or modifies the active policy." action={<Button variant="outline"><FileCheck2 />Export YAML</Button>} />
     <div className="grid gap-5 xl:grid-cols-[1fr_1fr]"><Card className="surface-card"><CardHeader className="border-b border-white/8 pb-4"><p className="eyebrow">Versions</p><CardTitle>Policy registry</CardTitle></CardHeader><CardContent className="space-y-3 pt-4">
-      <PolicyRow version="1.4.2" name="enterprise-default" status="ACTIVE" meta="18 rules · approved by sec-approver" />
-      <button type="button" onClick={() => setCandidate('balanced')} className={`w-full text-left ${candidate === 'balanced' ? 'ring-1 ring-cyan-400/35 rounded-xl' : ''}`}><PolicyRow version="1.5.0-rc2" name="balanced-routing" status="CANDIDATE" meta="Authored by platform-author · 7 changes" /></button>
-      <button type="button" onClick={() => setCandidate('strict')} className={`w-full text-left ${candidate === 'strict' ? 'ring-1 ring-cyan-400/35 rounded-xl' : ''}`}><PolicyRow version="1.5.0-rc1" name="strict-egress" status="CANDIDATE" meta="Authored by platform-author · 28 changes" /></button>
+      <PolicyRow version="2.0.0" name="enterprise-default" status="ACTIVE" meta="Scored engine · approved by sec-approver" />
+      <button type="button" onClick={() => setCandidate('balanced')} className={`w-full text-left ${candidate === 'balanced' ? 'ring-1 ring-cyan-400/35 rounded-xl' : ''}`}><PolicyRow version="2.1.0-rc2" name="balanced-routing" status="CANDIDATE" meta="Authored by platform-author · 7 changes" /></button>
+      <button type="button" onClick={() => setCandidate('strict')} className={`w-full text-left ${candidate === 'strict' ? 'ring-1 ring-cyan-400/35 rounded-xl' : ''}`}><PolicyRow version="2.1.0-rc1" name="strict-egress" status="CANDIDATE" meta="Authored by platform-author · 28 changes" /></button>
     </CardContent></Card>
     <Card className="surface-card"><CardHeader className="border-b border-white/8 pb-4"><p className="eyebrow">Candidate replay</p><CardTitle>{changes} decisions would change</CardTitle></CardHeader><CardContent className="pt-5"><div className="grid gap-3 sm:grid-cols-3"><ResultFact label="Allow → deny" value={String(candidate === 'strict' ? 21 : 2)} /><ResultFact label="Route changed" value={String(candidate === 'strict' ? 6 : 5)} /><ResultFact label="Approval added" value={String(candidate === 'strict' ? 1 : 0)} /></div><div className="mt-5 space-y-3">{['Schema validation', 'Security regression', 'Cost budget replay', 'Author / approver separation'].map((item) => <div key={item} className="flex items-center justify-between rounded-lg border border-white/7 p-3 text-xs"><span className="text-muted-foreground">{item}</span><span className="flex items-center gap-1.5 text-emerald-300"><CheckCircle2 className="size-3.5" />PASS</span></div>)}</div><Button disabled className="mt-4 w-full">Independent approval required</Button></CardContent></Card></div>
+    <p className="mt-4 text-xs text-muted-foreground">Illustrative only — this panel demonstrates the governance workflow with sample numbers; wiring it to replay the real session audit trail against an edited threshold set is tracked in the README roadmap.</p>
   </>;
 }
 
 function PolicyRow({ version, name, status, meta }: { version: string; name: string; status: string; meta: string }) { return <div className="rounded-xl border border-white/8 bg-white/[0.02] p-4"><div className="flex items-center justify-between gap-3"><div><p className="text-sm font-medium">{name}</p><p className="mt-1 text-xs text-muted-foreground">{meta}</p></div><div className="text-right"><Badge variant="outline" className={status === 'ACTIVE' ? 'border-emerald-400/25 text-emerald-300' : 'border-amber-400/25 text-amber-300'}>{status}</Badge><p className="mt-2 font-mono text-[10px] text-muted-foreground">v{version}</p></div></div></div>; }
 
-function EvaluationsView() { return <><PageHeading eyebrow="Evaluation harness" title="Security, quality, and cost—together." description="Metrics stay segmented by source and attack family so aggregate performance cannot hide a failed category." action={<Button className="bg-cyan-400 text-slate-950 hover:bg-cyan-300"><Play />Run deterministic suite</Button>} /><div className="mb-5 grid gap-3 sm:grid-cols-2 xl:grid-cols-4"><Metric icon={ShieldCheck} label="Attack recall" value="93.8%" detail="target ≥ 90%" tone="cyan" /><Metric icon={ShieldX} label="Benign block" value="3.1%" detail="target ≤ 5%" tone="emerald" /><Metric icon={Gauge} label="Quality pass" value="96.4%" detail="−1.2 pp vs strong" tone="amber" /><Metric icon={CircleDollarSign} label="Safe success / $" value="487" detail="+52% vs baseline" tone="rose" /></div><Card className="surface-card"><CardHeader className="border-b border-white/8 pb-4"><p className="eyebrow">Immutable run · eval_2026_09_02_01</p><CardTitle>Source and family breakdown</CardTitle></CardHeader><CardContent className="overflow-x-auto pt-2"><table className="w-full min-w-[680px] text-left text-xs"><thead className="text-[10px] uppercase tracking-[.13em] text-muted-foreground"><tr>{['Source', 'Family', 'Cases', 'Attack recall', 'Benign blocked', 'Gate'].map((heading) => <th key={heading} className="border-b border-white/8 px-3 py-3 font-medium">{heading}</th>)}</tr></thead><tbody>{evaluationRows.map((row) => <tr key={`${row.source}-${row.family}`} className="border-b border-white/6 last:border-0"><td className="px-3 py-4 font-medium">{row.source}</td><td className="px-3 py-4 text-muted-foreground">{row.family}</td><td className="px-3 py-4 font-mono">{row.cases}</td><td className="px-3 py-4 font-mono">{row.recall}</td><td className="px-3 py-4 font-mono">{row.blocked}</td><td className="px-3 py-4"><Badge className="bg-emerald-400/10 text-emerald-300">{row.status}</Badge></td></tr>)}</tbody></table></CardContent></Card></>; }
+function EvaluationsView() { return <><PageHeading eyebrow="Evaluation harness" title="Security, quality, and cost—together." description="Metrics stay segmented by source and attack family so aggregate performance cannot hide a failed category. Figures below are from the repository's fixture-based test run, not live telemetry." action={<Button className="bg-cyan-400 text-slate-950 hover:bg-cyan-300"><Play />Run deterministic suite</Button>} /><div className="mb-5 grid gap-3 sm:grid-cols-2 xl:grid-cols-4"><Metric icon={ShieldCheck} label="Attack recall" value="93.8%" detail="target ≥ 90%" tone="cyan" /><Metric icon={ShieldX} label="Benign block" value="3.1%" detail="target ≤ 5%" tone="emerald" /><Metric icon={Gauge} label="Quality pass" value="96.4%" detail="−1.2 pp vs strong" tone="amber" /><Metric icon={CircleDollarSign} label="Safe success / $" value="487" detail="+52% vs baseline" tone="rose" /></div><Card className="surface-card"><CardHeader className="border-b border-white/8 pb-4"><p className="eyebrow">Fixture run · npm test</p><CardTitle>Source and family breakdown</CardTitle></CardHeader><CardContent className="overflow-x-auto pt-2"><table className="w-full min-w-[680px] text-left text-xs"><thead className="text-[10px] uppercase tracking-[.13em] text-muted-foreground"><tr>{['Source', 'Family', 'Cases', 'Attack recall', 'Benign blocked', 'Gate'].map((heading) => <th key={heading} className="border-b border-white/8 px-3 py-3 font-medium">{heading}</th>)}</tr></thead><tbody>{evaluationRows.map((row) => <tr key={`${row.source}-${row.family}`} className="border-b border-white/6 last:border-0"><td className="px-3 py-4 font-medium">{row.source}</td><td className="px-3 py-4 text-muted-foreground">{row.family}</td><td className="px-3 py-4 font-mono">{row.cases}</td><td className="px-3 py-4 font-mono">{row.recall}</td><td className="px-3 py-4 font-mono">{row.blocked}</td><td className="px-3 py-4"><Badge className="bg-emerald-400/10 text-emerald-300">{row.status}</Badge></td></tr>)}</tbody></table></CardContent></Card></>; }
 
 function DataReleasesView() {
   const [selectedId, setSelectedId] = useState(publicDatasetRegistry.sources[0].id);
@@ -251,4 +449,3 @@ function DataReleasesView() {
 
 function Metric({ icon: Icon, label, value, detail, tone }: { icon: typeof ShieldCheck; label: string; value: string; detail: string; tone: 'cyan' | 'rose' | 'emerald' | 'amber' }) { return <Card className="surface-card" size="sm"><CardContent className="flex items-start gap-3"><div className={`metric-icon metric-${tone}`}><Icon className="size-4" /></div><div className="min-w-0"><p className="text-xs text-muted-foreground">{label}</p><p className="mt-1 text-xl font-semibold tracking-[-0.03em]">{value}</p><p className="mt-1 truncate text-[11px] text-muted-foreground">{detail}</p></div></CardContent></Card>; }
 function ResultFact({ label, value }: { label: string; value: string }) { return <div className="rounded-lg border border-white/6 bg-white/[0.025] p-3"><p className="text-[10px] uppercase tracking-[0.14em] text-muted-foreground">{label}</p><p className="mt-1.5 truncate text-xs font-medium">{value}</p></div>; }
-function RouteBar({ label, value, color }: { label: string; value: number; color: string }) { return <div><div className="mb-1.5 flex justify-between font-mono text-[11px]"><span className="text-muted-foreground">{label}</span><span>{value}%</span></div><div className="h-1.5 overflow-hidden rounded-full bg-white/6"><div className={`h-full rounded-full ${color}`} style={{ width: `${value}%` }} /></div></div>; }
