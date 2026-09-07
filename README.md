@@ -127,6 +127,159 @@ Request → input guard → weighted risk scan (injection / secret / pii / tool 
 
 Every decision carries a decision ID, stable reason codes, the individual rule hits with character spans, a risk score, per-stage timings, the selected route, estimated cost, and policy version. Prompt content is **never written to the audit log** — only a 60-character preview (`contentLogged: false`).
 
+## 🖱️ Console workflow — what each button actually triggers
+
+> [!TIP]
+> **Short answer:** clicking **▶ Run through gateway** is the *only* thing in the UI that calls `decide()` — and it calls **nothing else**. No model is contacted, no token is generated, no network hop leaves your machine.
+
+### 🎨 The full click-to-code trace
+
+```mermaid
+flowchart TD
+    subgraph BROWSER["🖥️ &nbsp;BROWSER &nbsp;·&nbsp; app/sentinel-console.tsx"]
+        direction TB
+        BTN1["▶️ <b>Run through gateway</b><br/><i>line 233</i>"]
+        RUN["🎬 runScenario&#40;&#41;<br/><i>line 116</i>"]
+        VAL{"✏️ Prompt<br/>non-empty?"}
+        ERR["🚫 Inline error<br/>nothing runs"]
+        REQ["📡 requestDecision&#40;&#41;<br/><i>line 66</i>"]
+        BTN2["🤖 <b>Generate with local model</b><br/><i>line 244</i>"]
+        GEN["🎧 generateOutput&#40;&#41;<br/><i>line 131 · SSE reader</i>"]
+        FALL["🛟 Offline fallback<br/>decide&#40;&#41; <b>in the browser</b><br/><i>line 74 · static profiles</i>"]
+        UI["🎛️ Outcome badge · risk · route<br/>cost · reason codes · spans<br/>+ session audit entry"]
+    end
+
+    subgraph SERVER["☁️ &nbsp;SERVER &nbsp;·&nbsp; Next.js route handlers"]
+        direction TB
+        API1["🔎 <b>POST /api/decide</b><br/><i>the inspector</i><br/>policy only — never a model"]
+        API2["🛡️ <b>POST /api/chat</b><br/><i>the enforcer</i><br/>policy, then maybe a model"]
+    end
+
+    subgraph ENGINE["🧠 &nbsp;ENGINE &nbsp;·&nbsp; lib/policy-engine.ts"]
+        direction TB
+        DEC["⚖️ <b>decide&#40;request, models&#41;</b><br/>score → threshold → route"]
+    end
+
+    subgraph PROV["🔌 &nbsp;PROVIDERS &nbsp;·&nbsp; lib/providers.ts"]
+        direction TB
+        STREAM["📶 streamFromProvider&#40;&#41;<br/>Ollama · LM Studio · llama.cpp · vLLM"]
+    end
+
+    BTN1 --> RUN --> VAL
+    VAL -- "empty" --> ERR
+    VAL -- "ok" --> REQ
+    REQ -- "fetch ok ✅" --> API1
+    REQ -- "fetch throws / non-OK ⚠️" --> FALL
+    API1 --> DEC
+    DEC -. "Decision JSON" .-> UI
+    FALL -. "Decision JSON<br/>badge: offline fallback" .-> UI
+    UI -- "ALLOW only 🟢" --> BTN2
+    BTN2 --> GEN --> API2
+    API2 --> DEC
+    DEC -- "🟢 ALLOW" --> STREAM
+    STREAM -. "SSE tokens" .-> GEN
+
+    classDef browser fill:#062d3b,stroke:#22d3ee,color:#e6fbff,stroke-width:2px;
+    classDef server fill:#2b1a46,stroke:#a78bfa,color:#f5f0ff,stroke-width:2px;
+    classDef engine fill:#4a3208,stroke:#fbbf24,color:#fffaeb,stroke-width:3px;
+    classDef danger fill:#491827,stroke:#fb7185,color:#fff0f3,stroke-width:2px;
+    classDef success fill:#073b32,stroke:#34d399,color:#ecfff9,stroke-width:2px;
+    classDef amber fill:#452a08,stroke:#f59e0b,color:#fff7ed,stroke-width:2px;
+    class BTN1,RUN,VAL,REQ,UI browser;
+    class BTN2,GEN success;
+    class API1,API2 server;
+    class DEC engine;
+    class ERR danger;
+    class FALL amber;
+    class STREAM success;
+```
+
+### 🔀 Two buttons, two very different jobs
+
+| | ▶️ **Run through gateway** | 🤖 **Generate with local model** |
+|---|---|---|
+| 🎯 **Purpose** | Inspect the policy verdict | Produce real model output |
+| 🛣️ **Endpoint** | `POST /api/decide` | `POST /api/chat` |
+| ⚖️ **Calls `decide()`?** | ✅ **Yes** — this is the trigger | ✅ **Yes — again, server-side** |
+| 🤖 **Contacts a model?** | ❌ **Never** | ✅ Only when the verdict is `ALLOW` |
+| 🔓 **Enabled when** | Always (with a non-empty prompt) | Only after an `ALLOW` verdict |
+| 📼 **Writes an audit entry** | ✅ Yes | ❌ No (the decision was already logged) |
+| ⏱️ **Typical latency** | ~0–1 ms | Seconds to minutes (see cold vs warm) |
+
+> [!IMPORTANT]
+> **`decide()` runs twice on purpose — that is the security property, not a redundancy.**
+> `/api/chat` re-evaluates policy independently at [chat/route.ts:42](app/api/chat/route.ts#L42). A hand-rolled client, a curl command, or a compromised front-end that skips `/api/decide` entirely **still cannot reach a provider.** The browser is never trusted to be the enforcement point.
+
+### 🚦 What `/api/chat` does with each verdict
+
+```mermaid
+flowchart LR
+    C["🛡️ POST /api/chat<br/>runs decide&#40;&#41;"] --> V{"⚖️ outcome"}
+    V -- "🔴 DENY" --> D["<b>403 Forbidden</b><br/>POLICY_DENIED<br/><i>chat/route.ts:44</i>"]
+    V -- "🟠 REQUIRE_APPROVAL" --> A["<b>202 Accepted</b><br/>decision returned<br/>awaits human approval<br/><i>chat/route.ts:45</i>"]
+    V -- "🟢 ALLOW" --> R{"🔌 Provider<br/>configured?"}
+    R -- "no" --> N["<b>503</b><br/>NO_LOCAL_PROVIDER<br/><i>chat/route.ts:60</i>"]
+    R -- "yes" --> S["<b>200 · text/event-stream</b><br/>event: decision → event: token* → event: done<br/><i>chat/route.ts:67</i>"]
+
+    classDef head fill:#2b1a46,stroke:#a78bfa,color:#f5f0ff,stroke-width:2px;
+    classDef gate fill:#4a3208,stroke:#fbbf24,color:#fffaeb,stroke-width:3px;
+    classDef danger fill:#491827,stroke:#fb7185,color:#fff0f3,stroke-width:2px;
+    classDef amber fill:#452a08,stroke:#f59e0b,color:#fff7ed,stroke-width:2px;
+    classDef success fill:#073b32,stroke:#34d399,color:#ecfff9,stroke-width:2px;
+    class C head;
+    class V,R gate;
+    class D,N danger;
+    class A amber;
+    class S success;
+```
+
+**🔑 The critical ordering:** `403` and `202` are returned **before any provider is contacted.** A denied request never becomes a token of inference cost — that is what makes the gateway a control and not a filter.
+
+### 🌐 Online vs offline — same policy, different home
+
+`requestDecision()` at [sentinel-console.tsx:66](app/sentinel-console.tsx#L66) wraps its `fetch` in a `try/catch`. If the server is unreachable, it falls through to running the **exact same `decide()` function directly in the browser** against static model profiles.
+
+| | 🟢 **Online path** | 🟠 **Offline fallback** |
+|---|---|---|
+| ⚖️ **Policy engine** | `lib/policy-engine.ts` | `lib/policy-engine.ts` — *identical* |
+| 📍 **Where it runs** | Server route handler | Browser, client-side |
+| 🤖 **Model catalogue** | Live discovery (`useLiveModels: true`) | Static reference profiles |
+| 🏷️ **UI signal** | *(none)* | `offline fallback · static models only` |
+| 🖱️ **Button still works** | ✅ | ✅ |
+
+The button triggers `decide()` **either way.** Only *where* it executes changes — which is exactly what makes the engine framework-agnostic and embeddable (see [Modularity](#-modularity--integrate-with-your-own-ai-workflow)).
+
+### 🎬 End-to-end sequence — the happy path
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as 👤 You
+    participant C as 🖥️ Console
+    participant D as 🔎 /api/decide
+    participant E as 🧠 decide&#40;&#41;
+    participant H as 🛡️ /api/chat
+    participant M as 🤖 qwen3 via Ollama
+
+    U->>C: ✏️ Type a prompt, set sensitivity / tool / quality / budget
+    U->>C: ▶️ Click "Run through gateway"
+    C->>D: POST prompt + context
+    D->>E: decide&#40;request, liveModels&#41;
+    E-->>D: ⚖️ Decision · risk · reasonCodes · spans · route · cost
+    D-->>C: 200 JSON
+    C-->>U: 🎛️ Badge + highlighted spans + audit entry
+    Note over C,U: 🛑 Nothing has touched a model yet.
+
+    U->>C: 🤖 Click "Generate with local model" (ALLOW only)
+    C->>H: POST the same payload
+    H->>E: decide&#40;&#41; again — independent enforcement
+    E-->>H: 🟢 ALLOW → qwen3:4b
+    H->>M: stream request to the routed model
+    M-->>H: 📶 tokens
+    H-->>C: SSE · event: decision → token* → done
+    C-->>U: ✨ Output renders live, token by token
+```
+
 ## 🧰 Tech stack
 
 | Layer | Technology | What it does |
