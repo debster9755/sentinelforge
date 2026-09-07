@@ -38,7 +38,8 @@ When a request is allowed, SentinelForge routes to the **cheapest compliant mode
 ## ⚙️ What does `decide()` do?
 
 > [!CAUTION]
-> $\color{red}{\textsf{decide() never calls a model. It is pure, deterministic risk-scoring code — the AI is invoked only after decide() has already said ALLOW.}}$
+> $\color{red}{\textsf{decide() never calls a model. It is pure, deterministic risk-scoring code.}}$
+> $\color{red}{\textsf{The AI is invoked only after decide() has already said ALLOW.}}$
 
 `decide()` in [`lib/policy-engine.ts`](lib/policy-engine.ts) is the one function every request passes through. It scans the prompt and request settings against a set of weighted rules (injection, secret, PII, tool, sensitivity), sums the risk each rule contributes — with the exact character span it matched — and a threshold turns that score into exactly one of three outcomes. Nothing downstream can override it.
 
@@ -249,7 +250,10 @@ curl -N -X POST http://localhost:3000/api/chat \
   -d '{"prompt":"<INPUT>","sensitivity":"public","qualityFloor":0.7}'
 ```
 
-**Suggested 5-minute running order:** `1 → 5 → 4 → 13 → 16 → 19 → 22 → 25`. That arc shows cheap routing, tier escalation, the flagship governance case, a PII escalation, the approval/replay flow, a hard block, a wallet attack, and a fail-closed budget.
+**Suggested 5-minute running order:** `1 → 5 → 4 → 13 → 16 → 19 → 22 → 25`. That arc shows cheap routing, tier escalation, the flagship governance case, a PII escalation, the approval/replay flow, a hard block, a wallet attack, and a fail-closed route.
+
+> [!WARNING]
+> Presenting on a machine that's low on free RAM? Read **[Best practice recommendation — running on limited RAM](#-best-practice-recommendation--running-on-limited-ram)** first. The policy decisions are always instant; only token generation is affected, and a cold `qwen3:14b` load can take ~15 minutes on a full 16 GB machine.
 
 ### The flagship case — governance reasoning, gated then answered
 
@@ -523,6 +527,53 @@ Honest gaps, so nobody mistakes this for a hardened production gateway:
 - **Rules are pattern-based.** The engine is deterministic and explainable by design, which also means it catches what its rules describe and nothing more. An optional LLM classifier that may only *escalate* (never de-escalate) is the natural next step.
 - **Cloudflare Workers can't reach `localhost`.** Local-provider routing works under `npm run dev` or a Node/Docker deployment only.
 - **Some panels are illustrative.** The Evaluations tab's headline metrics and the Policies tab's replay counts are sample figures from repository fixtures, not live telemetry. The Overview tab's metrics *are* live, computed from the session's own audit trail.
+
+## 🟠 Best practice recommendation — running on limited RAM
+
+> [!WARNING]
+> $\color{orange}{\textsf{Local model size, not SentinelForge, is what makes a demo feel slow.}}$
+> $\color{orange}{\textsf{The policy engine answers in 7 to 15 ms no matter how starved the machine is.}}$
+> $\color{orange}{\textsf{Only token generation is affected by free memory.}}$
+
+Every number below was measured on a **16 GB Apple M2 with roughly 100 MB free** — a deliberately memory-starved worst case, with Ollama, the dev server, and an editor all resident:
+
+| Stage | Model | State | Measured | Demo-safe? |
+|---|---|---|---:|:--:|
+| `POST /api/decide` (policy only) | — none — | any | **7–15 ms** | ✅ always |
+| `GET /api/models` (provider probe) | — none — | any | **~17 ms** | ✅ always |
+| `POST /api/chat` (generation) | `qwen3:4b` | cold | **11 s** | ✅ |
+| `POST /api/chat` (generation) | `qwen3:4b` | warm | **21 s** · 138 tokens | ✅ |
+| `POST /api/chat` (generation) | `qwen3:14b` | warm | **44 s** · even for a one-word answer | ⚠️ |
+| `POST /api/chat` (generation) | `qwen3:14b` | **cold** | **901 s (≈15 min)** · 9.6 GB load | ❌ |
+
+Both `qwen3:14b` runs returned the correct result and routed to `ROUTE_QWEN3_14B` exactly as documented — this is a *speed* constraint on the host, never a correctness one.
+
+### ✅ Do this
+
+1. **Demo generation on `qwen3:4b` only.** Pre-warm it immediately before presenting so the first request isn't a cold load:
+   ```bash
+   ollama run qwen3:4b "hi"        # ~10s once, then it's resident
+   ```
+2. **Keep the warmed model resident** for the length of the session, so it isn't evicted between slides:
+   ```bash
+   OLLAMA_KEEP_ALIVE=30m ollama serve
+   ```
+3. **For the top tier (case 5, quality floor `0.92` → `qwen3:14b`), show the routing decision, not the generation.** That case exists to prove *the quality floor forced the expensive tier* — which the decision panel proves in 8 ms. Clicking **Generate with local model** there adds 45 s to 15 min and demonstrates nothing further.
+4. **Send one request at a time.** Ollama serves a single generation slot by default (`-np 1`); overlapping requests queue silently and are indistinguishable from a hang.
+5. **Free memory before starting** — close other heavy applications. A 9.6 GB model on a 16 GB machine with an editor and a browser open will page to disk and crawl.
+
+### ❌ Avoid this
+
+- **Don't abort a request mid-generation** (`curl -m`, Ctrl-C) and immediately retry. The first generation keeps running server-side and the retry queues behind it, compounding the delay.
+- **Don't diagnose slowness as a hang** without checking first. Run `ollama ps` (is a model resident?) and `top -l 1 | grep PhysMem` (is memory exhausted?). A `llama-server` process showing sustained CPU is *working*, just slowly.
+- **Don't pull all three tiers on a 16 GB machine** if you only plan to demo one. `qwen3:4b` alone fully exercises the routing story at the `0.70` floor.
+
+### If your machine has ample RAM
+
+None of the above applies — pull all three tags and the tier ladder (`0.70` → `qwen3:4b`, `0.80` → `qwen3:8b`, `0.92` → `qwen3:14b`) demos end-to-end with live generation at each tier. The constraint is host memory, not the gateway.
+
+> [!TIP]
+> **The demo shape that always works, on any hardware:** run all 25 cases through the decision layer — instant, deterministic, and fully explainable down to the matched character span — then generate exactly once on `qwen3:4b` as the *"and it really does call a live model"* proof point.
 
 ## 🗂️ Repository map
 
